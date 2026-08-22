@@ -191,6 +191,14 @@ fn main() {
                 .long("saturation_only")
                 .help("Run saturation only"),
         )
+        .arg(
+            Arg::with_name("no_runtime_report")
+                .long("no_runtime_report")
+                .help("Skip evaluating full graph runtime (before/after) after extraction. \
+                       This calls TASO's real op execution (Graph::run/preprocess_weights), \
+                       which a CPU-only TASO build (USE_CUDA=OFF) cannot do -- pass this flag \
+                       to stop after extraction instead of hitting that."),
+        )
         .get_matches();
 
     let run_mode = matches.value_of("mode").unwrap();
@@ -237,6 +245,7 @@ fn optimize(matches: clap::ArgMatches) {
     let use_multi = matches.is_present("use_multi");
     let no_cycle = matches.is_present("no_cycle");
     let filter_after = !matches.is_present("filter_before");
+    let no_runtime_report = matches.is_present("no_runtime_report");
 
     // Get input graph and rules
     // learned_rules are the learned rules from TASO, pre_defined_rules are the hand-specified rules from TASO
@@ -423,11 +432,17 @@ fn optimize(matches: clap::ArgMatches) {
             runner_ext.egraph.dot().to_svg("target/ext.svg").unwrap();
         }
 
-        let time_start = get_full_graph_runtime(&runner_start, false);
-        println!("Start graph runtime: {}", time_start);
+        let (time_start, time_ext): (Option<f32>, Option<f32>) = if no_runtime_report {
+            println!("Skipping full graph runtime evaluation (--no_runtime_report)");
+            (None, None)
+        } else {
+            let time_start = get_full_graph_runtime(&runner_start, false);
+            println!("Start graph runtime: {}", time_start);
 
-        let time_ext = get_full_graph_runtime(&runner_ext, true);
-        println!("Extracted graph runtime: {}", time_ext);
+            let time_ext = get_full_graph_runtime(&runner_ext, true);
+            println!("Extracted graph runtime: {}", time_ext);
+            (Some(time_start), Some(time_ext))
+        };
 
         if let Some(exportf) = matches.value_of("export_model") {
             save_model(&runner_start, &(exportf.to_owned()+"_start.model"));

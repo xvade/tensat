@@ -24,4 +24,8 @@ path = "../egg"
 #rev = "986bff5c7d2e050e9aa980671c4c7d971c07da6f"
 
 [build-dependencies]
-bindgen = "0.54.0"
+# 0.54.0 (TASO/tensat's original pin) can't parse anonymous structs in
+# modern libc++ headers (e.g. current Xcode's <vector>) -- bump to a
+# current release. build.rs's API calls were updated to match
+# (allowlist_type instead of whitelist_type, CargoCallbacks::new()).
+bindgen = "0.70"

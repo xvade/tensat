@@ -14,3 +14,9 @@ bert_old_time.txt
 *.png
 ._*
 .DS_Store
+
+# Machine-specific local dev env (e.g. Homebrew protobuf path) -- see
+# TENSAT_SUMMARY.md for why this exists; don't commit it since it'll be
+# wrong on any other machine (esp. Linux/Docker).
+.envrc
+.direnv/

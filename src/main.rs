@@ -273,7 +273,13 @@ fn optimize(matches: clap::ArgMatches) {
                 .expect("Pls supply input graph file.");
             let input_graph =
                 read_to_string(model_file).expect("Something went wrong reading the model file");
-            input_graph.parse().unwrap()
+            // Was: input_graph.parse().unwrap(), i.e. generic RecExpr::from_str
+            // (egg's own S-expression grammar). That's a different format than
+            // what taso.export_to_file() actually writes (see tests/parse.rs),
+            // so -f silently produced a degenerate one-node graph on any real
+            // exported model instead of erroring. parse_model() is the parser
+            // built for that format; route through it instead.
+            parse_model(&input_graph).rec_expr()
         }
     };
 

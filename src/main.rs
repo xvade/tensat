@@ -192,6 +192,33 @@ fn main() {
                 .help("Run saturation only"),
         )
         .arg(
+            Arg::with_name("favor_fusion")
+                .long("favor_fusion")
+                .help("Deliberately discount Concat/Split/Enlarge's real measured cost \
+                       during extraction, so a legally-available multi-pattern-rule \
+                       fusion gets picked even though it's more real ops than what it \
+                       replaces (and so never wins under the unmodified cost model). \
+                       For pulling out an already-proven-valid equivalence to compare \
+                       against the unfused baseline, not a real cost-model claim."),
+        )
+        .arg(
+            Arg::with_name("n_random")
+                .long("n_random")
+                .takes_value(true)
+                .help("Instead of extracting a single best graph, sample this many \
+                       different (but egraph-equivalent) graphs at random from the \
+                       saturated egraph -- for comparing equivalent graphs against each \
+                       other rather than finding the single cheapest one. Writes \
+                       <export_model>_random0.model, _random1.model, etc."),
+        )
+        .arg(
+            Arg::with_name("random_seed")
+                .long("random_seed")
+                .takes_value(true)
+                .default_value("0")
+                .help("Base seed for --n_random sampling (sample i uses seed base+i)"),
+        )
+        .arg(
             Arg::with_name("no_runtime_report")
                 .long("no_runtime_report")
                 .help("Skip evaluating full graph runtime (before/after) after extraction. \
@@ -399,11 +426,47 @@ fn optimize(matches: clap::ArgMatches) {
                 eprintln!("Couldn't write to file: {}", e);
             }
         }
+    } else if let Some(n_random_str) = matches.value_of("n_random") {
+        // Sample N egraph-equivalent graphs at random instead of extracting a
+        // single best one -- see RandomCost in optimize.rs for what "random"
+        // means here and its caveats.
+        let n_random: u32 = n_random_str.parse().expect("--n_random must be an integer");
+        let base_seed: u64 = matches
+            .value_of("random_seed")
+            .unwrap()
+            .parse()
+            .expect("--random_seed must be an integer");
+        let cost_model = CostModel::with_favor_fusion(
+            /*ignore_all_weight_only=*/ matches.is_present("all_weight_only"),
+            /*favor_fusion=*/ matches.is_present("favor_fusion"),
+        );
+        for i in 0..n_random {
+            let seed = base_seed + i as u64;
+            let rand_cost = RandomCost::new(&egraph, &cost_model, seed);
+            let start_time = Instant::now();
+            let mut extractor = Extractor::new(&egraph, rand_cost);
+            let (best_cost, best) = extractor.find_best(root);
+            let duration = start_time.elapsed();
+            println!(
+                "Random sample {} (seed {}): cost {:?}, extraction took {:?}",
+                i, seed, best_cost, duration
+            );
+
+            let runner_ext = Runner::<Mdl, TensorAnalysis, ()>::default().with_expr(&best);
+            if !no_runtime_report {
+                let time_ext = get_full_graph_runtime(&runner_ext, true);
+                println!("  Sample {} graph runtime: {}", i, time_ext);
+            }
+            if let Some(exportf) = matches.value_of("export_model") {
+                save_model(&runner_ext, &format!("{}_random{}.model", exportf, i));
+            }
+        }
     } else {
         // Run extraction
         let extract_mode = matches.value_of("extract").unwrap();
-        let cost_model = CostModel::with_setting(
+        let cost_model = CostModel::with_favor_fusion(
             /*ignore_all_weight_only=*/ matches.is_present("all_weight_only"),
+            /*favor_fusion=*/ matches.is_present("favor_fusion"),
         );
         let (best, ext_secs) = match extract_mode {
             "ilp" => extract_by_ilp(&egraph, root, &matches, &cost_model),

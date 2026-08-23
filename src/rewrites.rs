@@ -975,6 +975,14 @@ impl MultiPatterns {
                 .map(|x| x.search(&runner.egraph))
                 .collect();
 
+            for (i, (pat, ms)) in self.canonical_src_pat.iter().zip(matches.iter()).enumerate() {
+                let total_substs: usize = ms.iter().map(|m| m.substs.len()).sum();
+                println!(
+                    "DEBUG multi-pattern canonical[{}] = {}  ->  {} eclasses matched, {} total substs",
+                    i, pat, ms.len(), total_substs
+                );
+            }
+
             if self.filter_after {
                 // Make a pass to get descendents
                 self.descendents = Some(compute_all_descendents(
@@ -985,9 +993,11 @@ impl MultiPatterns {
             }
 
             // For each multi rule
+            let mut debug_counters = (0usize, 0usize, 0usize, 0usize);
             'outer: for (i, rule) in self.rules.iter().enumerate() {
                 let map_1 = &self.src_pat_maps[i].0;
                 let map_2 = &self.src_pat_maps[i].1;
+                let rule_debug_before = debug_counters;
                 // If the rule is fully symmetrical
                 if map_1.index == map_2.index && rule.4 {
                     let matches_both = &matches[map_1.index];
@@ -997,7 +1007,7 @@ impl MultiPatterns {
                                 // We don't want to apply multi-pattern rules on the same eclass
                                 continue;
                             }
-                            let n_applied = self.apply_match_pair(rule, match_1, match_2, map_1, map_2, runner);
+                            let n_applied = self.apply_match_pair(rule, match_1, match_2, map_1, map_2, runner, &mut debug_counters);
                             //num_applied += n_applied;
                             //let num_nodes = runner.egraph.analysis.newly_added.len();
                             //if num_nodes - starting_num_nodes > self.node_limit {
@@ -1017,7 +1027,7 @@ impl MultiPatterns {
                                 // We don't want to apply multi-pattern rules on the same eclass
                                 continue;
                             }
-                            let n_applied = self.apply_match_pair(rule, match_1, match_2, map_1, map_2, runner);
+                            let n_applied = self.apply_match_pair(rule, match_1, match_2, map_1, map_2, runner, &mut debug_counters);
                             //num_applied += n_applied;
                             //let num_nodes = runner.egraph.analysis.newly_added.len();
                             //if num_nodes - starting_num_nodes > self.node_limit {
@@ -1029,7 +1039,16 @@ impl MultiPatterns {
                         }
                     }
                 }
+                if debug_counters != rule_debug_before {
+                    println!(
+                        "DEBUG multi-pattern rule[{}] src1={} src2={} dst1={} dst2={}  (pairs,compatible,valid,cycle_ok) this_rule={:?} running_total={:?}",
+                        i, rule.0, rule.1, rule.2, rule.3,
+                        (debug_counters.0 - rule_debug_before.0, debug_counters.1 - rule_debug_before.1, debug_counters.2 - rule_debug_before.2, debug_counters.3 - rule_debug_before.3),
+                        debug_counters
+                    );
+                }
             }
+            println!("DEBUG multi-pattern totals (pairs,compatible,valid,cycle_ok) = {:?}", debug_counters);
 
             runner.egraph.rebuild();
 
@@ -1070,15 +1089,18 @@ impl MultiPatterns {
         map_1: &MapToCanonical,
         map_2: &MapToCanonical,
         runner: &mut Runner<Mdl, TensorAnalysis, ()>,
+        debug_counters: &mut (usize, usize, usize, usize),
     ) -> usize {
         let mut num_applied = 0;
         for subst_1 in &match_1.substs {
             for subst_2 in &match_2.substs {
+                debug_counters.0 += 1;
                 // De-canonicalize the substitutions
                 let subst_1_dec = decanonicalize(subst_1, &map_1.var_map);
                 let subst_2_dec = decanonicalize(subst_2, &map_2.var_map);
                 // Check if two substitutions have matching shared variables
                 if compatible(&subst_1_dec, &subst_2_dec, &map_1.var_map) {
+                    debug_counters.1 += 1;
                     // If so, merge two substitutions
                     let merged_subst = merge_subst(subst_1_dec, subst_2_dec, &map_1.var_map);
                     // Check if any source pattern contains blacklisted nodes
@@ -1113,6 +1135,7 @@ impl MultiPatterns {
                         /*get_exist_nodes=*/ self.filter_after,
                     );
                     if valid_1 && valid_2 {
+                        debug_counters.2 += 1;
                         let cycle_check_passed = if self.no_cycle {
                             if self.filter_after {
                                 // Do pre-filtering using the pre-collected descendents info
@@ -1141,6 +1164,7 @@ impl MultiPatterns {
                             true
                         };
                         if cycle_check_passed {
+                            debug_counters.3 += 1;
                             // apply dst patterns, union
                             let id_1 =
                                 rule.2

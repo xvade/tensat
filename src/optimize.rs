@@ -23,12 +23,88 @@ impl CostFunction<Mdl> for TensorCost<'_> {
     }
 }
 
+/// Cost function that samples a different-but-plausible extraction by
+/// jittering the *real* cost model's per-node cost by a random multiplier,
+/// then summing over children same as TensorCost -- rather than assigning
+/// pure random costs.
+///
+/// Two prior versions were tried and both failed in practice:
+/// - Pure random cost, summed over children: strongly biases selection
+///   towards trees with fewer nodes (a multi-node equivalent subtree, e.g.
+///   a relu replaced by concat+relu+split, accumulates several random
+///   draws summed together, so it almost never beats a single-node
+///   alternative on expectation alone). Confirmed on resnet2b: 10 samples
+///   all landed on the exact same structure despite thousands of valid
+///   multi-pattern-rule-derived alternatives existing in the egraph.
+/// - Pure random cost, NOT summed over children (each class's
+///   representative chosen independently of its children): removes that
+///   bias entirely, but also removes the real cost model's preference for
+///   *small* structures, so extraction can pick unboundedly larger
+///   equivalent forms compounding across many e-classes at once --
+///   observed as an actual OOM kill on resnet2b's ~20k-node/12k-class
+///   saturated egraph when combined with building+evaluating 10 samples.
+///
+/// Jittering the real cost keeps its bounded-size behavior (still
+/// generally favors cheap/small structures, so it won't blow up the way
+/// pure independent-per-node randomness did) while letting close
+/// alternatives occasionally win because of the noise.
+pub struct RandomCost<'a> {
+    pub egraph: &'a EGraph<Mdl, TensorAnalysis>,
+    pub cost_model: &'a CostModel,
+    rng: rand::rngs::StdRng,
+    memo: HashMap<Mdl, f32>,
+    /// Multiplier range applied to each node's real self-cost.
+    jitter: (f32, f32),
+}
+
+impl<'a> RandomCost<'a> {
+    pub fn new(
+        egraph: &'a EGraph<Mdl, TensorAnalysis>,
+        cost_model: &'a CostModel,
+        seed: u64,
+    ) -> Self {
+        use rand::SeedableRng;
+        RandomCost {
+            egraph,
+            cost_model,
+            rng: rand::rngs::StdRng::seed_from_u64(seed),
+            memo: HashMap::new(),
+            jitter: (0.1, 3.0),
+        }
+    }
+}
+
+impl CostFunction<Mdl> for RandomCost<'_> {
+    type Cost = f32;
+    fn cost<C: FnMut(Id) -> Self::Cost>(&mut self, enode: &Mdl, mut costs: C) -> Self::Cost {
+        use rand::Rng;
+        let real_self_cost = self.cost_model.get_self_cost(self.egraph, enode);
+        let (lo, hi) = self.jitter;
+        let rng = &mut self.rng;
+        let self_cost = *self
+            .memo
+            .entry(enode.clone())
+            .or_insert_with(|| real_self_cost * rng.gen_range(lo, hi));
+        enode.fold(self_cost, |sum, id| sum + costs(id))
+    }
+}
+
 /// Class for our cost model
 pub struct CostModel {
     /// To have zero cost for all weight op only
     ignore_all_weight_only: bool,
     /// Discount factor for all weight ops
     all_weight_discount: f32,
+    /// Deliberately discount Concat/Split/Enlarge's real measured cost, so
+    /// deterministic extraction prefers a multi-pattern-rule fusion (e.g.
+    /// the relu-merge rule: two relus -> concat+relu+split) whenever one is
+    /// legally available, even though it's 3 real ops vs 1 and so never
+    /// wins under the real cost model on its own. Not a claim that fusion
+    /// is actually free -- purely a knob to make an already-proven-valid
+    /// equivalence observable for comparison, since neither plain greedy
+    /// extraction nor random sampling (biased-small, unbiased-but-OOMs,
+    /// jittered-real-cost) ever picks it otherwise.
+    favor_fusion: bool,
 }
 
 impl CostModel {
@@ -36,6 +112,15 @@ impl CostModel {
         CostModel {
             ignore_all_weight_only: ignore_all_weight_only,
             all_weight_discount: 1.0,
+            favor_fusion: false,
+        }
+    }
+
+    pub fn with_favor_fusion(ignore_all_weight_only: bool, favor_fusion: bool) -> Self {
+        CostModel {
+            ignore_all_weight_only: ignore_all_weight_only,
+            all_weight_discount: 1.0,
+            favor_fusion: favor_fusion,
         }
     }
 
@@ -57,7 +142,7 @@ impl CostModel {
     pub fn get_self_cost(&self, egraph: &EGraph<Mdl, TensorAnalysis>, enode: &Mdl) -> f32 {
         let x = |i: &Id| &egraph[*i].data;
         let mut g = egraph.analysis.graph.borrow_mut();
-        match enode {
+        let cost = match enode {
             Mdl::Num(_)
             | Mdl::Var(_)
             | Mdl::Input(_)
@@ -616,6 +701,20 @@ impl CostModel {
                 println!("Get cost not implemented for: {:?}", other);
                 0.0
             }
+        };
+        let is_fusion_op = matches!(
+            enode,
+            Mdl::Concat(_)
+                | Mdl::Concat3(_)
+                | Mdl::Concat4(_)
+                | Mdl::Concat5(_)
+                | Mdl::Split(_)
+                | Mdl::Enlarge(_)
+        );
+        if self.favor_fusion && is_fusion_op {
+            cost * 0.05
+        } else {
+            cost
         }
     }
 }

@@ -702,16 +702,47 @@ impl CostModel {
                 0.0
             }
         };
-        let is_fusion_op = matches!(
-            enode,
-            Mdl::Concat(_)
-                | Mdl::Concat3(_)
-                | Mdl::Concat4(_)
-                | Mdl::Concat5(_)
-                | Mdl::Split(_)
-                | Mdl::Enlarge(_)
-        );
-        if self.favor_fusion && is_fusion_op {
+        // Two structurally different multi-pattern rewrites both produce
+        // Concat/Split nodes: the parallel-conv-fusion rule (enlarge two
+        // weight kernels, concat them on the *output-channel* axis, one
+        // wider conv, split the channels back apart -- always safe, never
+        // touches axis 0 of any real activation) and a separate
+        // relu-merge rule that has both a channel-axis variant and a
+        // batch-axis variant (concat two *activations* together on axis 0,
+        // relu once, split back apart). The batch-axis variant is exactly
+        // what BUGS.md #11 found unverifiable by alpha-beta-CROWN (and by
+        // plain batch>1 ONNX inference).
+        //
+        // Merely *not* discounting axis-0 Concat/Split (an earlier version
+        // of this code) isn't enough to avoid it: confirmed by testing
+        // that greedy extraction picks the batch-axis relu-merge even with
+        // --favor_fusion off entirely, i.e. under the real, undiscounted
+        // cost model -- it's a genuine reuse win there (the batched relu
+        // subsumes a relu that's also needed directly elsewhere), not an
+        // artifact of any discount. So axis-0 Concat/Split needs an active
+        // penalty, not just neutral treatment, to be reliably excluded.
+        // Enlarge only ever operates on weight kernels' spatial dims (see
+        // enlarge.cc), never a batch axis, so it's always safe to favor.
+        let axis0_concat_or_split = match enode {
+            Mdl::Concat([axis, ..])
+            | Mdl::Concat3([axis, ..])
+            | Mdl::Concat4([axis, ..])
+            | Mdl::Concat5([axis, ..])
+            | Mdl::Split([axis, ..]) => x(axis).val == 0,
+            _ => false,
+        };
+        let is_favored_fusion_op = match enode {
+            Mdl::Concat([axis, ..])
+            | Mdl::Concat3([axis, ..])
+            | Mdl::Concat4([axis, ..])
+            | Mdl::Concat5([axis, ..])
+            | Mdl::Split([axis, ..]) => x(axis).val != 0,
+            Mdl::Enlarge(_) => true,
+            _ => false,
+        };
+        if self.favor_fusion && axis0_concat_or_split {
+            cost * 1000.0
+        } else if self.favor_fusion && is_favored_fusion_op {
             cost * 0.05
         } else {
             cost

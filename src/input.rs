@@ -55,7 +55,25 @@ impl GraphConverter {
     }
 
     pub fn new_weight(&mut self, dims: &[i32]) -> TensorInfo {
-        let name = self.name_gen.new_weight_name() + "@" + &dims.iter().join("_");
+        self.new_weight_named(dims, None)
+    }
+
+    /// Same as `new_weight`, but lets the caller supply the weight's real
+    /// (pre-saturation) identity instead of the synthetic "w_N" counter --
+    /// used when parsing a baseline model with a known guid->name sidecar
+    /// (see `parse::parse_model_with_names`), so `TensorAnalysis`'s
+    /// `weight_names` provenance tracking has real names to propagate
+    /// instead of meaningless positional ones. `real_name` must not
+    /// contain '@' (the name/dims separator).
+    pub fn new_weight_named(&mut self, dims: &[i32], real_name: Option<&str>) -> TensorInfo {
+        if let Some(n) = real_name {
+            assert!(!n.contains('@'), "weight name must not contain '@': {}", n);
+        }
+        let base = match real_name {
+            Some(n) => n.to_string(),
+            None => self.name_gen.new_weight_name(),
+        };
+        let name = base + "@" + &dims.iter().join("_");
         let node = Mdl::Var(Symbol::from(name));
         let name_id = self.rec_expr.add(node);
 

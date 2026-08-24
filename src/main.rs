@@ -199,7 +199,24 @@ fn main() {
                        fusion gets picked even though it's more real ops than what it \
                        replaces (and so never wins under the unmodified cost model). \
                        For pulling out an already-proven-valid equivalence to compare \
-                       against the unfused baseline, not a real cost-model claim."),
+                       against the unfused baseline, not a real cost-model claim. \
+                       Discount amount is --favor_fusion_strength (default 0.05 if this \
+                       flag is present but --favor_fusion_strength isn't given)."),
+        )
+        .arg(
+            Arg::with_name("favor_fusion_strength")
+                .long("favor_fusion_strength")
+                .takes_value(true)
+                .help("Only used with --favor_fusion. Continuous discount factor for \
+                       axis!=0 Concat/Split/Enlarge's real cost (CostModel::with_favor_fusion_strength \
+                       in optimize.rs) -- smaller values favor fusion more strongly. \
+                       Sampling across a range of values (rather than relying on a single \
+                       fixed discount plus jitter/diversity-penalty noise, which in \
+                       practice essentially never stumbles into a fused structure on its \
+                       own) is how the structural-diversity-vs-verifiability campaign \
+                       gets samples that reliably span unfused through fused. Default \
+                       0.05 (the old fixed --favor_fusion discount) when --favor_fusion \
+                       is present without this flag."),
         )
         .arg(
             Arg::with_name("n_random")
@@ -216,7 +233,45 @@ fn main() {
                 .long("random_seed")
                 .takes_value(true)
                 .default_value("0")
-                .help("Base seed for --n_random sampling (sample i uses seed base+i)"),
+                .help("Base seed for --n_random/--n_diverse sampling (sample i uses seed base+i)"),
+        )
+        .arg(
+            Arg::with_name("random_mode")
+                .long("random_mode")
+                .takes_value(true)
+                .default_value("jitter")
+                .possible_values(&["jitter", "uniform"])
+                .help("Only used with --n_random. 'jitter' (default, unchanged prior \
+                       behavior): RandomCost, jitters the real per-node cost by a random \
+                       multiplier -- still fundamentally shaped by the real cost model. \
+                       'uniform': UniformRandomCost, i.i.d. random cost per enode \
+                       independent of the real cost model entirely -- a structure-agnostic \
+                       baseline for comparison, at the cost of a known bias toward smaller \
+                       trees (see UniformRandomCost's doc-comment in optimize.rs)."),
+        )
+        .arg(
+            Arg::with_name("n_diverse")
+                .long("n_diverse")
+                .takes_value(true)
+                .help("Instead of extracting a single best graph, sample this many \
+                       graphs in sequence, each penalized against re-using any enode a \
+                       *previous* sample in this sequence already used -- pushes \
+                       successive samples toward structurally distinct regions of the \
+                       egraph rather than noisy perturbations of the same near-optimal \
+                       tree (DiverseCost in optimize.rs). Writes \
+                       <export_model>_diverse0.model, _diverse1.model, etc."),
+        )
+        .arg(
+            Arg::with_name("weight_names_json")
+                .long("weight_names_json")
+                .takes_value(true)
+                .help("Only used with -f/--model_file. JSON object mapping guid \
+                       (as it appears in that .model file, string-encoded) to a \
+                       real weight name, e.g. {\"101\": \"stem.weight\"}. Seeds \
+                       real weight identity at parse time instead of the default \
+                       synthetic \"w_N\" naming, so it propagates through \
+                       TensorAnalysis's weight_names provenance field for every \
+                       later rewrite/extraction of this graph."),
         )
         .arg(
             Arg::with_name("no_runtime_report")
@@ -255,6 +310,22 @@ fn convert_learned_rules(matches: clap::ArgMatches) {
 }
 
 fn test(matches: clap::ArgMatches) {}
+
+/// Resolves --favor_fusion/--favor_fusion_strength into the continuous
+/// strength CostModel::with_favor_fusion_strength expects: 1.0 (neutral,
+/// no bias) if --favor_fusion wasn't passed at all; otherwise
+/// --favor_fusion_strength's value, or 0.05 (the old fixed discount) if
+/// --favor_fusion was passed without an explicit strength.
+fn favor_fusion_strength_from_matches(matches: &clap::ArgMatches) -> f32 {
+    if !matches.is_present("favor_fusion") {
+        return 1.0;
+    }
+    matches
+        .value_of("favor_fusion_strength")
+        .unwrap_or("0.05")
+        .parse()
+        .expect("--favor_fusion_strength must be a float")
+}
 
 /// Main procedure to run optimization
 ///
@@ -306,7 +377,16 @@ fn optimize(matches: clap::ArgMatches) {
             // so -f silently produced a degenerate one-node graph on any real
             // exported model instead of erroring. parse_model() is the parser
             // built for that format; route through it instead.
-            parse_model(&input_graph).rec_expr()
+            match matches.value_of("weight_names_json") {
+                Some(names_path) => {
+                    let names_json = read_to_string(names_path)
+                        .expect("Something went wrong reading --weight_names_json");
+                    let guid_names: HashMap<usize, String> = serde_json::from_str(&names_json)
+                        .expect("--weight_names_json must be a JSON object of {\"guid\": \"name\"}");
+                    parse_model_with_names(&input_graph, &guid_names).rec_expr()
+                }
+                None => parse_model(&input_graph).rec_expr(),
+            }
         }
     };
 
@@ -428,28 +508,37 @@ fn optimize(matches: clap::ArgMatches) {
         }
     } else if let Some(n_random_str) = matches.value_of("n_random") {
         // Sample N egraph-equivalent graphs at random instead of extracting a
-        // single best one -- see RandomCost in optimize.rs for what "random"
-        // means here and its caveats.
+        // single best one -- see RandomCost/UniformRandomCost in optimize.rs
+        // for what "random" means under each --random_mode and their caveats.
         let n_random: u32 = n_random_str.parse().expect("--n_random must be an integer");
         let base_seed: u64 = matches
             .value_of("random_seed")
             .unwrap()
             .parse()
             .expect("--random_seed must be an integer");
-        let cost_model = CostModel::with_favor_fusion(
+        let random_mode = matches.value_of("random_mode").unwrap();
+        let cost_model = CostModel::with_favor_fusion_strength(
             /*ignore_all_weight_only=*/ matches.is_present("all_weight_only"),
-            /*favor_fusion=*/ matches.is_present("favor_fusion"),
+            /*favor_fusion_strength=*/ favor_fusion_strength_from_matches(&matches),
         );
         for i in 0..n_random {
             let seed = base_seed + i as u64;
-            let rand_cost = RandomCost::new(&egraph, &cost_model, seed);
-            let start_time = Instant::now();
-            let mut extractor = Extractor::new(&egraph, rand_cost);
-            let (best_cost, best) = extractor.find_best(root);
-            let duration = start_time.elapsed();
+            let (best_cost, best, duration) = if random_mode == "uniform" {
+                let cost_fn = UniformRandomCost::new(&egraph, seed);
+                let start_time = Instant::now();
+                let mut extractor = Extractor::new(&egraph, cost_fn);
+                let (best_cost, best) = extractor.find_best(root);
+                (best_cost, best, start_time.elapsed())
+            } else {
+                let cost_fn = RandomCost::new(&egraph, &cost_model, seed);
+                let start_time = Instant::now();
+                let mut extractor = Extractor::new(&egraph, cost_fn);
+                let (best_cost, best) = extractor.find_best(root);
+                (best_cost, best, start_time.elapsed())
+            };
             println!(
-                "Random sample {} (seed {}): cost {:?}, extraction took {:?}",
-                i, seed, best_cost, duration
+                "Random sample {} (mode {}, seed {}): cost {:?}, extraction took {:?}",
+                i, random_mode, seed, best_cost, duration
             );
 
             let runner_ext = Runner::<Mdl, TensorAnalysis, ()>::default().with_expr(&best);
@@ -458,15 +547,55 @@ fn optimize(matches: clap::ArgMatches) {
                 println!("  Sample {} graph runtime: {}", i, time_ext);
             }
             if let Some(exportf) = matches.value_of("export_model") {
-                save_model(&runner_ext, &format!("{}_random{}.model", exportf, i));
+                save_model_with_provenance(&runner_ext, &format!("{}_random{}.model", exportf, i));
+            }
+        }
+    } else if let Some(n_diverse_str) = matches.value_of("n_diverse") {
+        // Sample N graphs in sequence, each pushed away from enodes already
+        // used by a previous sample -- see DiverseCost in optimize.rs.
+        let n_diverse: u32 = n_diverse_str.parse().expect("--n_diverse must be an integer");
+        let base_seed: u64 = matches
+            .value_of("random_seed")
+            .unwrap()
+            .parse()
+            .expect("--random_seed must be an integer");
+        let cost_model = CostModel::with_favor_fusion_strength(
+            /*ignore_all_weight_only=*/ matches.is_present("all_weight_only"),
+            /*favor_fusion_strength=*/ favor_fusion_strength_from_matches(&matches),
+        );
+        let mut used: HashSet<Mdl> = HashSet::new();
+        for i in 0..n_diverse {
+            let seed = base_seed + i as u64;
+            let diverse_cost = DiverseCost::new(&egraph, &cost_model, &used, seed);
+            let start_time = Instant::now();
+            let mut extractor = Extractor::new(&egraph, diverse_cost);
+            let (best_cost, best) = extractor.find_best(root);
+            let duration = start_time.elapsed();
+            let n_used_before = used.len();
+            for node in best.as_ref() {
+                used.insert(node.clone());
+            }
+            println!(
+                "Diverse sample {} (seed {}): cost {:?}, extraction took {:?}, \
+                 {} new enodes added to the used set (total {})",
+                i, seed, best_cost, duration, used.len() - n_used_before, used.len()
+            );
+
+            let runner_ext = Runner::<Mdl, TensorAnalysis, ()>::default().with_expr(&best);
+            if !no_runtime_report {
+                let time_ext = get_full_graph_runtime(&runner_ext, true);
+                println!("  Sample {} graph runtime: {}", i, time_ext);
+            }
+            if let Some(exportf) = matches.value_of("export_model") {
+                save_model_with_provenance(&runner_ext, &format!("{}_diverse{}.model", exportf, i));
             }
         }
     } else {
         // Run extraction
         let extract_mode = matches.value_of("extract").unwrap();
-        let cost_model = CostModel::with_favor_fusion(
+        let cost_model = CostModel::with_favor_fusion_strength(
             /*ignore_all_weight_only=*/ matches.is_present("all_weight_only"),
-            /*favor_fusion=*/ matches.is_present("favor_fusion"),
+            /*favor_fusion_strength=*/ favor_fusion_strength_from_matches(&matches),
         );
         let (best, ext_secs) = match extract_mode {
             "ilp" => extract_by_ilp(&egraph, root, &matches, &cost_model),
@@ -518,7 +647,7 @@ fn optimize(matches: clap::ArgMatches) {
         }
 
         if let Some(exportf) = matches.value_of("export_model") {
-            save_model(&runner_ext, &(exportf.to_owned()+"_optimized.model"));
+            save_model_with_provenance(&runner_ext, &(exportf.to_owned()+"_optimized.model"));
         }
 
         if let Some(outf) = matches.value_of("out_file") {
@@ -711,6 +840,35 @@ fn save_model(runner: &Runner<Mdl, TensorAnalysis, ()>, file_name: &str) {
     unsafe {
         (*g).export_to_file_raw(CString::new(file_name).unwrap().into_raw());
     }
+}
+
+/// Same as `save_model`, but also emits a `<file_name>.weight_names.json`
+/// sidecar: guid -> sorted list of contributing weight names, for every
+/// Tnsr-typed eclass in `runner`'s egraph with a non-empty `weight_names`
+/// set (not just literal Weight leaves -- Enlarge/Concat-of-weights
+/// eclasses are covered too). Replaces per-extraction hand-tracing: the
+/// guid TASO assigns while replaying `runner`'s RecExpr and the
+/// `weight_names` provenance computed for that same eclass are both read
+/// off `class.data` in one pass, right after `save_model` assigns those
+/// guids. Only meaningful for an *extracted* model's runner (one built via
+/// `with_expr` from a RecExpr drawn from a provenance-seeded saturation
+/// egraph, e.g. via --weight_names_json) -- on an unseeded egraph every
+/// weight_names set is either empty or a synthetic "w_N" name.
+fn save_model_with_provenance(runner: &Runner<Mdl, TensorAnalysis, ()>, file_name: &str) {
+    save_model(runner, file_name);
+    let mut entries: HashMap<String, Vec<String>> = HashMap::new();
+    for class in runner.egraph.classes() {
+        let d = &class.data;
+        if d.dtype == DataKind::Tnsr && !d.weight_names.is_empty() && !d.meta.is_null() {
+            let guid = unsafe { (*d.meta).op.guid };
+            let mut names: Vec<String> = d.weight_names.iter().cloned().collect();
+            names.sort();
+            entries.insert(guid.to_string(), names);
+        }
+    }
+    let sidecar_path = format!("{}.weight_names.json", file_name);
+    let json = serde_json::to_string_pretty(&entries).expect("failed to serialize weight_names sidecar");
+    write(&sidecar_path, json).expect("failed to write weight_names sidecar");
 }
 
 fn prove_taso_rules(matches: clap::ArgMatches) {

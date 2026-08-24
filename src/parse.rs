@@ -81,6 +81,23 @@ pub fn parse_and_convert(rs_s: &str) -> String {
 // parses a serialized model from taso
 // see tests/parse.rs for an example
 pub fn parse_model(rs_s: &str) -> GraphConverter {
+    parse_model_impl(rs_s, None)
+}
+
+/// Same as `parse_model`, but seeds real weight identities (instead of the
+/// synthetic "w_N" counter) via a `guid -> real_name` sidecar map, keyed by
+/// each Weight op's guid as it appears in `rs_s` -- so `TensorAnalysis`'s
+/// `weight_names` provenance (see model.rs) has real names to propagate
+/// from this parse onward, through every later rewrite/extraction of the
+/// resulting egraph. Intended for parsing a model's *baseline* (first,
+/// pre-saturation) `.model` file specifically -- extractions/samples drawn
+/// from the same saturation egraph never need their own sidecar, since
+/// provenance is computed once per eclass and carried forward automatically.
+pub fn parse_model_with_names(rs_s: &str, guid_names: &HashMap<usize, String>) -> GraphConverter {
+    parse_model_impl(rs_s, Some(guid_names))
+}
+
+fn parse_model_impl(rs_s: &str, guid_names: Option<&HashMap<usize, String>>) -> GraphConverter {
     let mut ls = rs_s.lines();
     let mut g = GraphConverter::default();
     let mut nodes: HashMap<usize, Vec<TensorInfo>> = HashMap::new();
@@ -109,7 +126,10 @@ pub fn parse_model(rs_s: &str) -> GraphConverter {
             // node is really a vec, because split may return two outputs
             let node: Vec<TensorInfo> = match op {
                 OpType_OP_INPUT => vec![g.new_input(&params)],
-                OpType_OP_WEIGHT => vec![g.new_weight(&params)],
+                OpType_OP_WEIGHT => {
+                    let real_name = guid_names.and_then(|m| m.get(&guid)).map(String::as_str);
+                    vec![g.new_weight_named(&params, real_name)]
+                },
                 OpType_OP_MATMUL => vec![g.matmul(
                     nodes[&deps[0][0]][deps[0][1]],
                     nodes[&deps[1][0]][deps[1][1]],

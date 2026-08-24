@@ -7,6 +7,7 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 //use rand::prelude::*;
 use rand;
 use root::taso::*;
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::convert::TryInto;
 use std::time::{Duration, Instant};
@@ -92,6 +93,12 @@ pub struct ValTnsr {
     pub meta_2: TensorHandle,
     /// If the tensor results from all weights computations
     pub all_weights: bool,
+    /// Names of the original (pre-saturation) weight(s) this eclass's
+    /// tensor is derived from -- empty if not weight-derived at all (e.g.
+    /// pure Input), a singleton at a Weight leaf, union of children
+    /// elsewhere. Lets any extracted RecExpr's weight-derived eclasses
+    /// carry their own provenance, without per-extraction guid-tracing.
+    pub weight_names: BTreeSet<String>,
 }
 
 impl Default for ValTnsr {
@@ -139,12 +146,15 @@ impl Analysis<Mdl> for TensorAnalysis {
 
     /// Merges two metadata when two eclasses are merged.
     fn merge(&self, to: &mut Self::Data, from: Self::Data) -> bool {
+        let mut changed = false;
         if from.all_weights && (!to.all_weights) {
             to.all_weights = from.all_weights;
-            true
-        } else {
-            false
+            changed = true;
         }
+        let before = to.weight_names.len();
+        to.weight_names.extend(from.weight_names);
+        changed |= to.weight_names.len() != before;
+        changed
     }
 
     // Constructs metadata for a new enode, using TASO side functions for tensors.
@@ -173,6 +183,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                 let t_b = x(b).meta;
                 let activation: ActiMode = x(act).val.try_into().unwrap();
                 let all_weights = x(a).all_weights && x(b).all_weights;
+                let weight_names: BTreeSet<String> = x(a).weight_names.union(&x(b).weight_names).cloned().collect();
 
                 // Create tensorhandle and get metadata
                 let res = unsafe { g.matmul(t_a, t_b, activation) };
@@ -183,6 +194,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             }
 
@@ -201,6 +213,11 @@ impl Analysis<Mdl> for TensorAnalysis {
                 let t_mean = x(mean).meta;
                 let t_var = x(var).meta;
                 let all_weights = x(input).all_weights && x(scale).all_weights && x(bias).all_weights && x(mean).all_weights && x(var).all_weights;
+                let mut weight_names: BTreeSet<String> = x(input).weight_names.clone();
+                weight_names.extend(x(scale).weight_names.iter().cloned());
+                weight_names.extend(x(bias).weight_names.iter().cloned());
+                weight_names.extend(x(mean).weight_names.iter().cloned());
+                weight_names.extend(x(var).weight_names.iter().cloned());
 
                 // Create tensorhandle and get metadata
                 let res =
@@ -212,6 +229,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             },
             Mdl::Conv2d([stride_h, stride_w, pad, act, inpt, wght]) => {
@@ -231,6 +249,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                 let padding: PaddingMode = x(pad).val.try_into().unwrap();
                 let activation: ActiMode = x(act).val.try_into().unwrap();
                 let all_weights = x(inpt).all_weights && x(wght).all_weights;
+                let weight_names: BTreeSet<String> = x(inpt).weight_names.union(&x(wght).weight_names).cloned().collect();
 
                 // Create tensorhandle and get metadata
                 let res =
@@ -242,6 +261,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             }
 
@@ -254,6 +274,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                 let t_a = x(a).meta;
                 let t_b = x(b).meta;
                 let all_weights = x(a).all_weights && x(b).all_weights;
+                let weight_names: BTreeSet<String> = x(a).weight_names.union(&x(b).weight_names).cloned().collect();
 
                 // Create tensorhandle and get metadata
                 let res = unsafe { g.element(OpType_OP_EW_ADD, t_a, t_b) };
@@ -264,6 +285,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             }
 
@@ -276,6 +298,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                 let t_a = x(a).meta;
                 let t_b = x(b).meta;
                 let all_weights = x(a).all_weights && x(b).all_weights;
+                let weight_names: BTreeSet<String> = x(a).weight_names.union(&x(b).weight_names).cloned().collect();
 
                 // Create tensorhandle and get metadata
                 let res = unsafe { g.element(OpType_OP_EW_MUL, t_a, t_b) };
@@ -286,6 +309,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             }
 
@@ -293,6 +317,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                 assert!(x(a).dtype == DataKind::Tnsr);
                 let t_a = x(a).meta;
                 let all_weights = x(a).all_weights;
+                let weight_names = x(a).weight_names.clone();
 
                 let res = unsafe { g.dropout(t_a) };
                 Self::Data {
@@ -302,6 +327,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             }
  
@@ -309,6 +335,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                 assert!(x(a).dtype == DataKind::Tnsr);
                 let t_a = x(a).meta;
                 let all_weights = x(a).all_weights;
+                let weight_names = x(a).weight_names.clone();
 
                 let res = unsafe { g.relu(t_a, true) };
                 Self::Data {
@@ -318,6 +345,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             }
 
@@ -325,6 +353,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                 assert!(x(a).dtype == DataKind::Tnsr);
                 let t_a = x(a).meta;
                 let all_weights = x(a).all_weights;
+                let weight_names = x(a).weight_names.clone();
 
                 let res = unsafe { g.tanh(t_a, true) };
                 Self::Data {
@@ -334,6 +363,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             }
 
@@ -341,6 +371,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                 assert!(x(a).dtype == DataKind::Tnsr);
                 let t_a = x(a).meta;
                 let all_weights = x(a).all_weights;
+                let weight_names = x(a).weight_names.clone();
 
                 let res = unsafe { g.sigmoid(t_a, true) };
                 Self::Data {
@@ -350,6 +381,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             }
 
@@ -374,12 +406,25 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: false,
+                    weight_names: BTreeSet::new(),
                 }
             }
 
             Mdl::Weight([name]) => {
                 // Check types
                 assert!(x(name).dtype == DataKind::Name);
+
+                // Provenance: the name-before-`@` half of the child Var
+                // eclass's string. Under the default synthetic naming
+                // (tensat/src/input.rs's `new_weight_name()`, "w_0",
+                // "w_1", ...) this is just a positional counter; when the
+                // baseline model was parsed via `parse_model_with_names`
+                // (tensat/src/parse.rs) with a real guid->name sidecar,
+                // it's the real original weight name instead, and that
+                // identity now propagates through every op that derives
+                // from this weight (see `merge()` and the other arms'
+                // `weight_names` unions above).
+                let weight_name = x(name).name.split('@').next().unwrap().to_string();
 
                 // Get arguments
                 let mut dims = dim_from_name(name);
@@ -406,6 +451,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: true,
+                    weight_names: std::iter::once(weight_name).collect(),
                 }
             }
 
@@ -421,6 +467,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                 let t_b = x(b).meta;
                 let axis_val = x(axis).val;
                 let all_weights = x(a).all_weights && x(b).all_weights;
+                let weight_names: BTreeSet<String> = x(a).weight_names.union(&x(b).weight_names).cloned().collect();
 
                 // Create tensorhandle and get metadata
                 let t = [t_a, t_b];
@@ -432,6 +479,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             }
 
@@ -451,6 +499,9 @@ impl Analysis<Mdl> for TensorAnalysis {
                 let all_weights = x(input1).all_weights
                     && x(input2).all_weights
                     && x(input3).all_weights;
+                let mut weight_names: BTreeSet<String> = x(input1).weight_names.clone();
+                weight_names.extend(x(input2).weight_names.iter().cloned());
+                weight_names.extend(x(input3).weight_names.iter().cloned());
 
                 // Create tensorhandle and get metadata
                 let t = [t_1, t_2, t_3];
@@ -462,6 +513,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             }
 
@@ -484,6 +536,10 @@ impl Analysis<Mdl> for TensorAnalysis {
                     && x(input2).all_weights
                     && x(input3).all_weights
                     && x(input4).all_weights;
+                let mut weight_names: BTreeSet<String> = x(input1).weight_names.clone();
+                weight_names.extend(x(input2).weight_names.iter().cloned());
+                weight_names.extend(x(input3).weight_names.iter().cloned());
+                weight_names.extend(x(input4).weight_names.iter().cloned());
 
                 // Create tensorhandle and get metadata
                 let t = [t_1, t_2, t_3, t_4];
@@ -495,6 +551,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             }
 
@@ -520,6 +577,11 @@ impl Analysis<Mdl> for TensorAnalysis {
                     && x(input3).all_weights
                     && x(input4).all_weights
                     && x(input5).all_weights;
+                let mut weight_names: BTreeSet<String> = x(input1).weight_names.clone();
+                weight_names.extend(x(input2).weight_names.iter().cloned());
+                weight_names.extend(x(input3).weight_names.iter().cloned());
+                weight_names.extend(x(input4).weight_names.iter().cloned());
+                weight_names.extend(x(input5).weight_names.iter().cloned());
 
                 // Create tensorhandle and get metadata
                 let t = [t_1, t_2, t_3, t_4, t_5];
@@ -531,6 +593,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             }
 
@@ -543,6 +606,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                 let t_weight = x(weight).meta;
                 let count_val = x(count).val;
                 let all_weights = x(weight).all_weights;
+                let weight_names = x(weight).weight_names.clone();
 
                 // Create tensorhandle and get metadata
                 let res = unsafe { g.merge_gconv(t_weight, count_val) };
@@ -553,6 +617,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             }
 
@@ -575,6 +640,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                 let padding: PaddingMode = x(pad).val.try_into().unwrap();
                 let activation: ActiMode = x(act).val.try_into().unwrap();
                 let all_weights = x(inpt).all_weights;
+                let weight_names = x(inpt).weight_names.clone();
 
                 // Create tensorhandle and get metadata
                 let res = unsafe {
@@ -589,6 +655,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             }
 
@@ -611,6 +678,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                 let padding: PaddingMode = x(pad).val.try_into().unwrap();
                 let activation: ActiMode = x(act).val.try_into().unwrap();
                 let all_weights = x(inpt).all_weights;
+                let weight_names = x(inpt).weight_names.clone();
 
                 // Create tensorhandle and get metadata
                 let res = unsafe {
@@ -625,6 +693,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             }
 
@@ -637,6 +706,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                 let t_inpt = x(inpt).meta;
                 let axis_val = x(axis).val;
                 let all_weights = x(inpt).all_weights;
+                let weight_names = x(inpt).weight_names.clone();
 
                 // Create tensorhandle and get metadata
                 unsafe {
@@ -658,6 +728,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                         meta: res_1,
                         meta_2: res_2,
                         all_weights: all_weights,
+                        weight_names: weight_names,
                     }
                 }
             }
@@ -666,6 +737,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                 // Check types
                 assert!(x(inpt).dtype == DataKind::TnsrTuple);
                 let all_weights = x(inpt).all_weights;
+                let weight_names = x(inpt).weight_names.clone();
 
                 let res = x(inpt).meta;
                 Self::Data {
@@ -675,6 +747,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             }
 
@@ -682,6 +755,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                 // Check types
                 assert!(x(inpt).dtype == DataKind::TnsrTuple);
                 let all_weights = x(inpt).all_weights;
+                let weight_names = x(inpt).weight_names.clone();
 
                 let res = x(inpt).meta_2;
                 Self::Data {
@@ -691,6 +765,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             }
 
@@ -703,6 +778,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                 let t_a = x(a).meta;
                 let t_b = x(b).meta;
                 let all_weights = x(a).all_weights && x(b).all_weights;
+                let weight_names: BTreeSet<String> = x(a).weight_names.union(&x(b).weight_names).cloned().collect();
 
                 // Create tensorhandle and get metadata
                 let res = unsafe { g.enlarge(t_a, t_b) };
@@ -713,6 +789,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             }
 
@@ -729,6 +806,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     .collect();
                 let t_inpt = x(inpt).meta;
                 let all_weights = x(inpt).all_weights;
+                let weight_names = x(inpt).weight_names.clone();
 
                 // Create tensorhandle and get metadata
                 let res = unsafe {
@@ -743,6 +821,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             }
 
@@ -762,6 +841,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                 let shuffle_val = x(shuffle).val;
                 let shuffle_bool = (shuffle_val == SHUFFLE);
                 let all_weights = x(inpt).all_weights;
+                let weight_names = x(inpt).weight_names.clone();
 
                 // Create tensorhandle and get metadata
                 let res = unsafe {
@@ -776,6 +856,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: res,
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             }
 
@@ -784,6 +865,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                 assert!(x(a).dtype == DataKind::Tnsr);
                 assert!(x(b).dtype == DataKind::Tnsr);
                 let all_weights = x(a).all_weights && x(b).all_weights;
+                let weight_names: BTreeSet<String> = x(a).weight_names.union(&x(b).weight_names).cloned().collect();
 
                 Self::Data {
                     dtype: DataKind::Tnsr,
@@ -792,6 +874,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                     meta: std::ptr::null_mut(),
                     meta_2: std::ptr::null_mut(),
                     all_weights: all_weights,
+                    weight_names: weight_names,
                 }
             }
 
@@ -802,6 +885,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                 meta: std::ptr::null_mut(),
                 meta_2: std::ptr::null_mut(),
                 all_weights: false,
+                weight_names: BTreeSet::new(),
             },
 
             Mdl::Var(_s) => Self::Data {
@@ -811,6 +895,7 @@ impl Analysis<Mdl> for TensorAnalysis {
                 meta: std::ptr::null_mut(),
                 meta_2: std::ptr::null_mut(),
                 all_weights: false,
+                weight_names: BTreeSet::new(),
             },
 
             other => {

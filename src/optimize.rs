@@ -89,22 +89,147 @@ impl CostFunction<Mdl> for RandomCost<'_> {
     }
 }
 
+/// A structure-agnostic random baseline, for comparison against
+/// `RandomCost`'s jittered-real-cost sampling (which is still fundamentally
+/// shaped by the real cost model, just noisy). Each enode gets an i.i.d.
+/// draw independent of what op it actually is or what it costs to run --
+/// still summed over children (not per-class-independent) to stay bounded,
+/// since the un-summed version is exactly the "OOM on resnet2b" failure
+/// mode documented on `RandomCost` above. This keeps the same *known,
+/// reported* small-tree bias as the first (summed) attempt described
+/// there -- a multi-node equivalent subtree accumulates more random draws
+/// than a single-node alternative almost regardless of the draws -- which
+/// is why this exists as an explicit, separate mode rather than replacing
+/// `RandomCost`'s default: it's a deliberately weaker, unbiased-by-op-type
+/// baseline for the structural-diversity-vs-verifiability campaign, not a
+/// claim that it samples the equivalence class uniformly.
+pub struct UniformRandomCost<'a> {
+    pub egraph: &'a EGraph<Mdl, TensorAnalysis>,
+    rng: rand::rngs::StdRng,
+    memo: HashMap<Mdl, f32>,
+    /// Range each enode's i.i.d. self-cost is drawn from.
+    range: (f32, f32),
+}
+
+impl<'a> UniformRandomCost<'a> {
+    pub fn new(egraph: &'a EGraph<Mdl, TensorAnalysis>, seed: u64) -> Self {
+        use rand::SeedableRng;
+        UniformRandomCost {
+            egraph,
+            rng: rand::rngs::StdRng::seed_from_u64(seed),
+            memo: HashMap::new(),
+            range: (1.0, 10.0),
+        }
+    }
+}
+
+impl CostFunction<Mdl> for UniformRandomCost<'_> {
+    type Cost = f32;
+    fn cost<C: FnMut(Id) -> Self::Cost>(&mut self, enode: &Mdl, mut costs: C) -> Self::Cost {
+        use rand::Rng;
+        let (lo, hi) = self.range;
+        let rng = &mut self.rng;
+        let self_cost = *self
+            .memo
+            .entry(enode.clone())
+            .or_insert_with(|| rng.gen_range(lo, hi));
+        enode.fold(self_cost, |sum, id| sum + costs(id))
+    }
+}
+
+/// Cost function for the diversity-seeking sampler (`--n_diverse`): drawing
+/// several samples in sequence, each one penalized against re-selecting any
+/// enode a *previous* sample already used, so successive samples are
+/// pushed toward covering structurally distinct regions of the egraph
+/// rather than just noisily perturbing the same near-optimal tree
+/// (`RandomCost`'s failure mode when alternatives are far from cost-
+/// competitive). Cost = jittered real cost (reusing `RandomCost`'s own
+/// jitter range, so once the single top choice at some e-class is
+/// exhausted, extraction doesn't just deterministically repick the same
+/// "obvious" runner-up every subsequent round) plus a large additive
+/// penalty if the enode is in `used`. Additive, not multiplicative, so a
+/// zero-or-near-zero-real-cost node (e.g. a `Weight`/`Input` leaf) is still
+/// meaningfully discouraged from reuse instead of the penalty vanishing
+/// along with the base cost.
+pub struct DiverseCost<'a> {
+    pub egraph: &'a EGraph<Mdl, TensorAnalysis>,
+    pub cost_model: &'a CostModel,
+    pub used: &'a HashSet<Mdl>,
+    rng: rand::rngs::StdRng,
+    memo: HashMap<Mdl, f32>,
+    jitter: (f32, f32),
+    penalty: f32,
+}
+
+impl<'a> DiverseCost<'a> {
+    pub fn new(
+        egraph: &'a EGraph<Mdl, TensorAnalysis>,
+        cost_model: &'a CostModel,
+        used: &'a HashSet<Mdl>,
+        seed: u64,
+    ) -> Self {
+        use rand::SeedableRng;
+        DiverseCost {
+            egraph,
+            cost_model,
+            used,
+            rng: rand::rngs::StdRng::seed_from_u64(seed),
+            memo: HashMap::new(),
+            jitter: (0.1, 3.0),
+            penalty: 1e6,
+        }
+    }
+}
+
+impl CostFunction<Mdl> for DiverseCost<'_> {
+    type Cost = f32;
+    fn cost<C: FnMut(Id) -> Self::Cost>(&mut self, enode: &Mdl, mut costs: C) -> Self::Cost {
+        use rand::Rng;
+        let real_self_cost = self.cost_model.get_self_cost(self.egraph, enode);
+        let (lo, hi) = self.jitter;
+        let rng = &mut self.rng;
+        let jittered = *self
+            .memo
+            .entry(enode.clone())
+            .or_insert_with(|| real_self_cost * rng.gen_range(lo, hi));
+        let penalty = if self.used.contains(enode) { self.penalty } else { 0.0 };
+        enode.fold(jittered + penalty, |sum, id| sum + costs(id))
+    }
+}
+
 /// Class for our cost model
 pub struct CostModel {
     /// To have zero cost for all weight op only
     ignore_all_weight_only: bool,
     /// Discount factor for all weight ops
     all_weight_discount: f32,
-    /// Deliberately discount Concat/Split/Enlarge's real measured cost, so
-    /// deterministic extraction prefers a multi-pattern-rule fusion (e.g.
-    /// the relu-merge rule: two relus -> concat+relu+split) whenever one is
-    /// legally available, even though it's 3 real ops vs 1 and so never
-    /// wins under the real cost model on its own. Not a claim that fusion
-    /// is actually free -- purely a knob to make an already-proven-valid
-    /// equivalence observable for comparison, since neither plain greedy
-    /// extraction nor random sampling (biased-small, unbiased-but-OOMs,
-    /// jittered-real-cost) ever picks it otherwise.
-    favor_fusion: bool,
+    /// Continuous discount applied to axis!=0 Concat/Split/Enlarge's real
+    /// measured cost: 1.0 is neutral (no bias at all -- byte-identical to
+    /// the old boolean favor_fusion=false path), and progressively smaller
+    /// values make a legally-available multi-pattern-rule fusion (e.g. the
+    /// relu-merge rule: two relus -> concat+relu+split) win more and more
+    /// readily under deterministic extraction, even though it's more real
+    /// ops than what it replaces and so never wins under the unmodified
+    /// cost model on its own. Not a claim that fusion is actually free --
+    /// a knob to make an already-proven-valid equivalence observable for
+    /// comparison.
+    ///
+    /// Originally a plain bool (on = discount by a fixed 0.05x). Made
+    /// continuous because the fixed discount's cost advantage turned out
+    /// to be marginal rather than decisive -- deterministic extraction
+    /// with it enabled sometimes still didn't find the known InceptionMNIST
+    /// fusion (run-to-run noise in TASO's own real-cost measurement, from
+    /// the random dummy weight *values* `Mdl::Weight`'s `make()` fills in,
+    /// was enough to flip the winner). That marginality is exactly why
+    /// `--n_random`/`--n_diverse` sampling (which layers jitter or a
+    /// diversity penalty on TOP of this already-close gap) essentially
+    /// never stumbled into the fused structure on its own -- see
+    /// `PROGRESS.md`'s structural-diversity-vs-verifiability campaign
+    /// entry. Sampling across a RANGE of strengths (e.g. 1.0, 0.5, 0.2,
+    /// 0.05, 0.01) is how that campaign gets samples that reliably span
+    /// clearly-unfused through clearly-fused, instead of relying on noise
+    /// to land in the interesting region.
+    favor_fusion_strength: f32,
 }
 
 impl CostModel {
@@ -112,15 +237,15 @@ impl CostModel {
         CostModel {
             ignore_all_weight_only: ignore_all_weight_only,
             all_weight_discount: 1.0,
-            favor_fusion: false,
+            favor_fusion_strength: 1.0,
         }
     }
 
-    pub fn with_favor_fusion(ignore_all_weight_only: bool, favor_fusion: bool) -> Self {
+    pub fn with_favor_fusion_strength(ignore_all_weight_only: bool, favor_fusion_strength: f32) -> Self {
         CostModel {
             ignore_all_weight_only: ignore_all_weight_only,
             all_weight_discount: 1.0,
-            favor_fusion: favor_fusion,
+            favor_fusion_strength: favor_fusion_strength,
         }
     }
 
@@ -740,10 +865,15 @@ impl CostModel {
             Mdl::Enlarge(_) => true,
             _ => false,
         };
-        if self.favor_fusion && axis0_concat_or_split {
+        let neutral = self.favor_fusion_strength == 1.0;
+        if !neutral && axis0_concat_or_split {
+            // Always a fixed 1000x penalty regardless of strength: axis-0
+            // Concat/Split is unverifiable by design (BUGS.md #11), so
+            // there's never a reason to bias sampling *toward* it, no
+            // matter how strongly we're favoring fusion in general.
             cost * 1000.0
-        } else if self.favor_fusion && is_favored_fusion_op {
-            cost * 0.05
+        } else if !neutral && is_favored_fusion_op {
+            cost * self.favor_fusion_strength
         } else {
             cost
         }

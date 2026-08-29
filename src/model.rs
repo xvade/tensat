@@ -7,7 +7,9 @@ include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 //use rand::prelude::*;
 use rand;
 use root::taso::*;
+use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::convert::TryInto;
 use std::time::{Duration, Instant};
@@ -111,6 +113,25 @@ impl Default for ValTnsr {
     }
 }
 
+/// Provenance of a multi-pattern rewrite that created an enode. An enode is a
+/// "rewrite witness" iff it was constructed by applying a multi-pattern rule's
+/// dst pattern (e.g. a `Concat`/`Split`/wider-`Conv2d` from the conv-fusion or
+/// relu-merge rules) -- i.e. it exists in the egraph *only* because that rule
+/// fired. Selecting such an enode at extraction time is what makes an extracted
+/// model carry that rule's architecture. Recorded during saturation
+/// (rewrites.rs `apply_match_pair`), read at extraction time by `ArchDiverseCost`
+/// (optimize.rs) to bias sampling toward architecturally distinct regions.
+#[derive(Debug, Clone, Copy)]
+pub struct RewriteWitness {
+    /// Index into MultiPatterns.rules of the rule that created this enode.
+    pub rule_index: usize,
+    /// Saturation iteration at which it was created (disambiguates compound
+    /// rewrites built on top of earlier rewrites' outputs).
+    pub iteration: usize,
+    /// Monotonic per-run counter of successful rule applications (ordering).
+    pub application_id: usize,
+}
+
 /// Struct for metadata analysis
 ///
 /// In this analysis, it calls functions on the TASO side (e.g. graph.matmul())
@@ -123,6 +144,12 @@ pub struct TensorAnalysis {
     pub blacklist_nodes: HashSet<Mdl>,
     /// Newly added nodes by order
     pub newly_added: Vec<Mdl>,
+    /// Which enodes were created by which multi-pattern rewrite (see
+    /// `RewriteWitness`). Written during saturation by the multi-pattern hook,
+    /// read at extraction time. `RefCell` so `make()`/`merge()` (which take
+    /// `&self`) stay untouched -- only the rewrite hook, which has `&mut
+    /// egraph`, writes here, and only the cost function, with `&egraph`, reads.
+    pub rewrite_witness: RefCell<HashMap<Mdl, RewriteWitness>>,
 }
 
 impl Default for TensorAnalysis {
@@ -136,6 +163,7 @@ impl Default for TensorAnalysis {
                 graph: std::cell::RefCell::new(graph),
                 blacklist_nodes: HashSet::<Mdl>::new(),
                 newly_added: Vec::<Mdl>::new(),
+                rewrite_witness: RefCell::new(HashMap::new()),
             }
         }
     }

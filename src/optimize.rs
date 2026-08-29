@@ -197,6 +197,80 @@ impl CostFunction<Mdl> for DiverseCost<'_> {
     }
 }
 
+/// Cost function for ARCHITECTURE-diverse extraction. DiverseCost only ever
+/// *penalizes* reused enodes, so a fused subtree's higher intrinsic cost always
+/// wins out and the extractor never crosses the cost cliff onto it -- which is
+/// why it only ever produced the (unfused) baseline structure. ArchDiverseCost
+/// instead *rewards* selecting the rewrite-witness enodes of a chosen
+/// `target_rule` (making that architecture family cheaper so it actually wins
+/// its e-class), and *penalizes* witnesses of already-`covered_rules` families.
+/// Rotating `target_rule` across a sequence of samples yields (at most) one
+/// extraction per reachable rewrite family -- diverse by construction, O(#rules),
+/// never enumerating the extraction space. Reads the per-enode provenance
+/// recorded during saturation (`TensorAnalysis::rewrite_witness`, model.rs).
+pub struct ArchDiverseCost<'a> {
+    pub egraph: &'a EGraph<Mdl, TensorAnalysis>,
+    pub cost_model: &'a CostModel,
+    /// Rewrite family (index into MultiPatterns.rules) to reward this sample.
+    pub target_rule: Option<usize>,
+    /// Families prior samples already covered -- penalize their witnesses.
+    pub covered_rules: &'a HashSet<usize>,
+    rng: rand::rngs::StdRng,
+    memo: HashMap<Mdl, f32>,
+    jitter: (f32, f32),
+    reward: f32,
+    penalty: f32,
+}
+
+impl<'a> ArchDiverseCost<'a> {
+    pub fn new(
+        egraph: &'a EGraph<Mdl, TensorAnalysis>,
+        cost_model: &'a CostModel,
+        target_rule: Option<usize>,
+        covered_rules: &'a HashSet<usize>,
+        seed: u64,
+        reward: f32,
+        penalty: f32,
+    ) -> Self {
+        use rand::SeedableRng;
+        ArchDiverseCost {
+            egraph,
+            cost_model,
+            target_rule,
+            covered_rules,
+            rng: rand::rngs::StdRng::seed_from_u64(seed),
+            memo: HashMap::new(),
+            jitter: (0.1, 3.0),
+            reward,
+            penalty,
+        }
+    }
+}
+
+impl CostFunction<Mdl> for ArchDiverseCost<'_> {
+    type Cost = f32;
+    fn cost<C: FnMut(Id) -> Self::Cost>(&mut self, enode: &Mdl, mut costs: C) -> Self::Cost {
+        use rand::Rng;
+        let real_self_cost = self.cost_model.get_self_cost(self.egraph, enode);
+        let (lo, hi) = self.jitter;
+        let rng = &mut self.rng;
+        let jittered = *self
+            .memo
+            .entry(enode.clone())
+            .or_insert_with(|| real_self_cost * rng.gen_range(lo, hi));
+        // Provenance-driven bias: reward the target family's witnesses (drive
+        // their self-cost to 0 so the fused representative wins its e-class),
+        // penalize already-covered families. Clamp at 0 -- never negative, so
+        // extraction can't be driven to prefer unboundedly larger trees.
+        let bias = match self.egraph.analysis.rewrite_witness.borrow().get(enode) {
+            Some(w) if Some(w.rule_index) == self.target_rule => -self.reward,
+            Some(w) if self.covered_rules.contains(&w.rule_index) => self.penalty,
+            _ => 0.0,
+        };
+        enode.fold((jittered + bias).max(0.0), |sum, id| sum + costs(id))
+    }
+}
+
 /// Class for our cost model
 pub struct CostModel {
     /// To have zero cost for all weight op only

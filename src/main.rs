@@ -262,6 +262,37 @@ fn main() {
                        <export_model>_diverse0.model, _diverse1.model, etc."),
         )
         .arg(
+            Arg::with_name("n_arch_diverse")
+                .long("n_arch_diverse")
+                .takes_value(true)
+                .help("Architecture-diverse sampling: emit one extraction per \
+                       multi-pattern rewrite FAMILY reachable in the egraph (plus a \
+                       baseline sample 0 with no target). Unlike --n_diverse (which \
+                       only penalizes reused enodes and so only ever re-emits the \
+                       unfused baseline), each sample REWARDS a target rule's \
+                       rewrite-witness enodes so that fusion actually wins its \
+                       e-class -- see ArchDiverseCost in optimize.rs. N caps the \
+                       number of samples. Writes <export_model>_arch0.model, etc."),
+        )
+        .arg(
+            Arg::with_name("arch_reward")
+                .long("arch_reward")
+                .takes_value(true)
+                .default_value("100000")
+                .help("Only with --n_arch_diverse. Additive discount applied to the \
+                       target rule's witness enodes (clamped so self-cost >= 0), to \
+                       flip extraction onto that fusion family."),
+        )
+        .arg(
+            Arg::with_name("arch_penalty")
+                .long("arch_penalty")
+                .takes_value(true)
+                .default_value("1000000")
+                .help("Only with --n_arch_diverse. Additive penalty on witness enodes \
+                       of already-covered rule families, to push each new sample onto \
+                       an uncovered family."),
+        )
+        .arg(
             Arg::with_name("weight_names_json")
                 .long("weight_names_json")
                 .takes_value(true)
@@ -475,7 +506,7 @@ fn optimize(matches: clap::ArgMatches) {
     println!("  Number of programs: {}", num_programs);
 
     // Save egraph
-    let (egraph, root) = (runner.egraph, runner.roots[0]);
+    let (mut egraph, root) = (runner.egraph, runner.roots[0]);
     if save_graph == "all" {
         egraph.dot().to_svg("target/tensat.svg").unwrap();
     }
@@ -588,6 +619,117 @@ fn optimize(matches: clap::ArgMatches) {
             }
             if let Some(exportf) = matches.value_of("export_model") {
                 save_model_with_provenance(&runner_ext, &format!("{}_diverse{}.model", exportf, i));
+            }
+        }
+    } else if let Some(n_arch_str) = matches.value_of("n_arch_diverse") {
+        // Architecture-diverse sampling: one extraction per reachable
+        // multi-pattern rewrite family, by REWARDING that family's
+        // rewrite-witness enodes so the fused representative wins its e-class.
+        // See ArchDiverseCost in optimize.rs and the design rationale there.
+        let n_arch: u32 = n_arch_str.parse().expect("--n_arch_diverse must be an integer");
+        let base_seed: u64 = matches
+            .value_of("random_seed")
+            .unwrap()
+            .parse()
+            .expect("--random_seed must be an integer");
+        let reward: f32 = matches
+            .value_of("arch_reward")
+            .unwrap()
+            .parse()
+            .expect("--arch_reward must be a float");
+        let penalty: f32 = matches
+            .value_of("arch_penalty")
+            .unwrap()
+            .parse()
+            .expect("--arch_penalty must be a float");
+        let cost_model = CostModel::with_favor_fusion_strength(
+            /*ignore_all_weight_only=*/ matches.is_present("all_weight_only"),
+            /*favor_fusion_strength=*/ favor_fusion_strength_from_matches(&matches),
+        );
+        // Re-canonicalize witness keys to match the enodes the extractor sees.
+        canonicalize_rewrite_witness(&mut egraph);
+        // Which rule families have witnesses reachable in this egraph, and how
+        // many each -- order targets by witness count DESCENDING so the
+        // structurally-dominant fusion families (many witnesses) are targeted
+        // first rather than cut off by the sample cap.
+        let mut rule_counts: std::collections::BTreeMap<usize, usize> =
+            std::collections::BTreeMap::new();
+        for w in egraph.analysis.rewrite_witness.borrow().values() {
+            *rule_counts.entry(w.rule_index).or_insert(0) += 1;
+        }
+        let mut ranked: Vec<(usize, usize)> = rule_counts.iter().map(|(&r, &c)| (r, c)).collect();
+        ranked.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        println!(
+            "Arch-diverse: {} rule families have witnesses (rule:count, by count desc): {:?}",
+            ranked.len(),
+            ranked
+        );
+        // Sample 0 = baseline (no target); then one sample per available family,
+        // most-populous first.
+        let targets: Vec<Option<usize>> = std::iter::once(None)
+            .chain(ranked.iter().map(|&(r, _)| Some(r)))
+            .take(n_arch as usize)
+            .collect();
+        let mut covered: HashSet<usize> = HashSet::new();
+        for (i, target_rule) in targets.iter().enumerate() {
+            let seed = base_seed + i as u64;
+            let arch_cost = ArchDiverseCost::new(
+                &egraph,
+                &cost_model,
+                *target_rule,
+                &covered,
+                seed,
+                reward,
+                penalty,
+            );
+            let start_time = Instant::now();
+            let mut extractor = Extractor::new(&egraph, arch_cost);
+            let (best_cost, best) = extractor.find_best(root);
+            let duration = start_time.elapsed();
+            // Detect fusion STRUCTURALLY: Concat/Split enodes only ever enter
+            // the egraph via a multi-pattern fusion rule, so their presence in
+            // the extracted tree is a reliable "this extraction is fused" signal
+            // (the witness map is keyed by egraph enodes with canonical child
+            // Ids, which don't match the RecExpr's local Ids, so we can't look
+            // it up directly). If a targeted sample came out fused, mark that
+            // family covered so later samples are pushed off it.
+            let n_concat = best
+                .as_ref()
+                .iter()
+                .filter(|n| matches!(n, Mdl::Concat(_)))
+                .count();
+            let n_split = best
+                .as_ref()
+                .iter()
+                .filter(|n| matches!(n, Mdl::Split(_) | Mdl::Split0(_) | Mdl::Split1(_)))
+                .count();
+            let is_fused = n_concat > 0 || n_split > 0;
+            if is_fused {
+                if let Some(r) = target_rule {
+                    covered.insert(*r);
+                }
+            }
+            println!(
+                "Arch-diverse sample {} (seed {}, target rule {:?}): cost {:?}, took {:?} -- \
+                 {} ({} nodes, concat={}, split={})",
+                i,
+                seed,
+                target_rule,
+                best_cost,
+                duration,
+                if is_fused { "FUSED" } else { "unfused" },
+                best.as_ref().len(),
+                n_concat,
+                n_split
+            );
+
+            let runner_ext = Runner::<Mdl, TensorAnalysis, ()>::default().with_expr(&best);
+            if !no_runtime_report {
+                let time_ext = get_full_graph_runtime(&runner_ext, true);
+                println!("  Sample {} graph runtime: {}", i, time_ext);
+            }
+            if let Some(exportf) = matches.value_of("export_model") {
+                save_model_with_provenance(&runner_ext, &format!("{}_arch{}.model", exportf, i));
             }
         }
     } else {

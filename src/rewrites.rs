@@ -1007,7 +1007,7 @@ impl MultiPatterns {
                                 // We don't want to apply multi-pattern rules on the same eclass
                                 continue;
                             }
-                            let n_applied = self.apply_match_pair(rule, match_1, match_2, map_1, map_2, runner, &mut debug_counters);
+                            let n_applied = self.apply_match_pair(i, rule, match_1, match_2, map_1, map_2, runner, &mut debug_counters);
                             //num_applied += n_applied;
                             //let num_nodes = runner.egraph.analysis.newly_added.len();
                             //if num_nodes - starting_num_nodes > self.node_limit {
@@ -1027,7 +1027,7 @@ impl MultiPatterns {
                                 // We don't want to apply multi-pattern rules on the same eclass
                                 continue;
                             }
-                            let n_applied = self.apply_match_pair(rule, match_1, match_2, map_1, map_2, runner, &mut debug_counters);
+                            let n_applied = self.apply_match_pair(i, rule, match_1, match_2, map_1, map_2, runner, &mut debug_counters);
                             //num_applied += n_applied;
                             //let num_nodes = runner.egraph.analysis.newly_added.len();
                             //if num_nodes - starting_num_nodes > self.node_limit {
@@ -1049,6 +1049,22 @@ impl MultiPatterns {
                 }
             }
             println!("DEBUG multi-pattern totals (pairs,compatible,valid,cycle_ok) = {:?}", debug_counters);
+
+            // Validation: report how many rewrite-witness enodes exist per rule
+            // index so far (the provenance ArchDiverseCost consumes).
+            {
+                let witness = runner.egraph.analysis.rewrite_witness.borrow();
+                let mut per_rule: std::collections::BTreeMap<usize, usize> =
+                    std::collections::BTreeMap::new();
+                for w in witness.values() {
+                    *per_rule.entry(w.rule_index).or_insert(0) += 1;
+                }
+                println!(
+                    "DEBUG rewrite-witness total={} per-rule(rule_index:count)={:?}",
+                    witness.len(),
+                    per_rule
+                );
+            }
 
             runner.egraph.rebuild();
 
@@ -1083,6 +1099,7 @@ impl MultiPatterns {
     /// Returns the number of successful applications
     fn apply_match_pair(
         &self,
+        rule_index: usize,
         rule: &(Pattern<Mdl>, Pattern<Mdl>, Pattern<Mdl>, Pattern<Mdl>, bool),
         match_1: &SearchMatches,
         match_2: &SearchMatches,
@@ -1165,6 +1182,12 @@ impl MultiPatterns {
                         };
                         if cycle_check_passed {
                             debug_counters.3 += 1;
+                            // Snapshot the newly_added frontier before applying,
+                            // so we can tag exactly the enodes THIS rule
+                            // application creates with their rewrite provenance.
+                            let witness_before = runner.egraph.analysis.newly_added.len();
+                            let witness_iteration = runner.iterations.len();
+                            let witness_app_id = debug_counters.3;
                             // apply dst patterns, union
                             let id_1 =
                                 rule.2
@@ -1204,6 +1227,30 @@ impl MultiPatterns {
                                 if n_after > n_before {
                                     num_applied += 1;
                                 }*/
+                            }
+
+                            // Record rewrite provenance: every enode this rule
+                            // application newly created (the newly_added delta,
+                            // populated by add_newly_added on the filter_after
+                            // path -- which is what --no_cycle runs use) is a
+                            // "witness" of rule `rule_index`. ArchDiverseCost
+                            // reads this at extraction to steer sampling toward
+                            // architecturally distinct regions. On non-filter_after
+                            // paths newly_added isn't tracked, so this is a no-op
+                            // there (documented limitation; our runs use --no_cycle).
+                            let n_now = runner.egraph.analysis.newly_added.len();
+                            if n_now > witness_before {
+                                let new_nodes: Vec<Mdl> =
+                                    runner.egraph.analysis.newly_added[witness_before..].to_vec();
+                                let mut witness =
+                                    runner.egraph.analysis.rewrite_witness.borrow_mut();
+                                for node in new_nodes {
+                                    witness.entry(node).or_insert(RewriteWitness {
+                                        rule_index,
+                                        iteration: witness_iteration,
+                                        application_id: witness_app_id,
+                                    });
+                                }
                             }
 
                             runner.egraph.union(id_1, match_1.eclass);
@@ -1252,6 +1299,29 @@ impl MultiPatterns {
             !descendents_input.contains(&out_class_1) && !descendents_input.contains(&out_class_2)
         });
     }
+}
+
+/// Re-canonicalize the keys of the `rewrite_witness` provenance map so they
+/// match the canonical enodes the extractor will iterate after all
+/// unions/rebuilds. Witnesses are recorded during saturation with the child
+/// Ids current at creation time; later unions can re-point those Ids, so
+/// without this pass the extractor's canonical query enodes would miss stored
+/// witnesses. Mirrors the newly_added re-canonicalization in
+/// `remove_cycle_by_order`. Call once after `runner.run(...)`, before extraction.
+pub fn canonicalize_rewrite_witness(egraph: &mut EGraph<Mdl, TensorAnalysis>) {
+    let old: Vec<(Mdl, RewriteWitness)> = egraph
+        .analysis
+        .rewrite_witness
+        .borrow()
+        .iter()
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    let mut new_map = HashMap::<Mdl, RewriteWitness>::new();
+    for (node, w) in old {
+        let canon = node.map_children(|id| egraph.find(id));
+        new_map.entry(canon).or_insert(w);
+    }
+    *egraph.analysis.rewrite_witness.borrow_mut() = new_map;
 }
 
 /// Do post-processing to remove cycles in the egraph, by adding nodes to blacklist.

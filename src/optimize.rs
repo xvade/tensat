@@ -479,6 +479,31 @@ impl CostModel {
                 }
             }
 
+            // Elementwise sub/max/min: same cost handling as ewadd, dispatched on op.
+            Mdl::Ewsub([_a, _b]) | Mdl::Ewmax([_a, _b]) | Mdl::Ewmin([_a, _b]) => {
+                let _a_data = x(_a);
+                let _b_data = x(_b);
+                assert!(_a_data.dtype == DataKind::Tnsr);
+                assert!(_b_data.dtype == DataKind::Tnsr);
+                let t_a = _a_data.meta;
+                let t_b = _b_data.meta;
+                let op_ty = match enode {
+                    Mdl::Ewsub(_) => OpType_OP_EW_SUB,
+                    Mdl::Ewmax(_) => OpType_OP_EW_MAX,
+                    _ => OpType_OP_EW_MIN,
+                };
+                let runtime = unsafe {
+                    let op = (*g.model).get_or_create_element(op_ty, t_a, t_b);
+                    assert!(op != Op_INVALID_OP);
+                    (*op.ptr).runtime.clone()
+                };
+                if self.ignore_all_weight_only && x(_a).all_weights && x(_b).all_weights {
+                    self.all_weight_discount * runtime
+                } else {
+                    runtime
+                }
+            }
+
             Mdl::Ewmul([_a, _b]) => {
                 // Check types
                 let _a_data = x(_a);

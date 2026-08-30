@@ -34,6 +34,9 @@ define_language! {
         "weight"    = Weight([Id; 1]), // takes a Var, format : name@dim1_dim2...
         "ewadd"     = Ewadd([Id; 2]),
         "ewmul"     = Ewmul([Id; 2]),
+        "ewsub"     = Ewsub([Id; 2]), // elementwise; verifiability (PWL) rewrites
+        "ewmax"     = Ewmax([Id; 2]), // elementwise max
+        "ewmin"     = Ewmin([Id; 2]), // elementwise min
         "smul"      = Smul([Id; 2]),
         "transpose" = Transpose([Id; 3]), // input, perm_name (format: dim1_dim2...), shuffle
         "matmul"    = Matmul([Id; 3]), // activation, input1, input2
@@ -330,6 +333,32 @@ impl Analysis<Mdl> for TensorAnalysis {
 
                 // Create tensorhandle and get metadata
                 let res = unsafe { g.element(OpType_OP_EW_MUL, t_a, t_b) };
+                Self::Data {
+                    dtype: DataKind::Tnsr,
+                    val: 0,
+                    name: String::new(),
+                    meta: res,
+                    meta_2: std::ptr::null_mut(),
+                    all_weights: all_weights,
+                    weight_names: weight_names,
+                }
+            }
+
+            // Elementwise sub/max/min: identical shape/metadata handling to
+            // ewadd/ewmul, dispatched on the TASO op type.
+            Mdl::Ewsub([a, b]) | Mdl::Ewmax([a, b]) | Mdl::Ewmin([a, b]) => {
+                assert!(x(a).dtype == DataKind::Tnsr);
+                assert!(x(b).dtype == DataKind::Tnsr);
+                let t_a = x(a).meta;
+                let t_b = x(b).meta;
+                let all_weights = x(a).all_weights && x(b).all_weights;
+                let weight_names: BTreeSet<String> = x(a).weight_names.union(&x(b).weight_names).cloned().collect();
+                let op = match enode {
+                    Mdl::Ewsub(_) => OpType_OP_EW_SUB,
+                    Mdl::Ewmax(_) => OpType_OP_EW_MAX,
+                    _ => OpType_OP_EW_MIN,
+                };
+                let res = unsafe { g.element(op, t_a, t_b) };
                 Self::Data {
                     dtype: DataKind::Tnsr,
                     val: 0,

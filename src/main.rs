@@ -318,6 +318,16 @@ fn main() {
                        |lambda|, weighting that ReLU's gap. Omit => unweighted."),
         )
         .arg(
+            Arg::with_name("query_chain")
+                .long("query_chain")
+                .takes_value(false)
+                .help("Diagnostic: after saturation, query whether the left-deep CHAIN \
+                       association of the (min-of-max) start graph is present in the \
+                       e-graph. Reports natural-order break depth, an order-independent \
+                       subset closure, blacklist membership, and root-equivalence. Read \
+                       the printed Stopped: reason for the budget verdict."),
+        )
+        .arg(
             Arg::with_name("weight_names_json")
                 .long("weight_names_json")
                 .takes_value(true)
@@ -568,6 +578,187 @@ fn optimize(matches: clap::ArgMatches) {
                 eprintln!("Couldn't write to file: {}", e);
             }
         }
+    } else if matches.is_present("query_chain") {
+        // DIAGNOSTIC (reachability): is the left-deep CHAIN association of the
+        // min-of-max start graph present in the SATURATED e-graph? This separates
+        // four verdicts for why the tight (chain) lattice form is never extracted:
+        //   chain in memo, not blacklisted        -> cost function's fault
+        //   chain in memo, blacklisted             -> cycle filter, not budget/cost
+        //   chain absent, Stopped = *Limit         -> saturation budget
+        //   chain absent, Stopped = Saturated      -> rule gap (assoc didn't fire)
+        // The "Stopped:" reason was already printed above; do NOT grep it away.
+        let nodes: &[Mdl] = start.as_ref();
+        let n = nodes.len();
+
+        // (1) Map every RecExpr index -> its canonical e-graph Id. All present:
+        //     `start` was added via with_expr, and children precede parents.
+        let mut id_of: Vec<Id> = vec![Id::from(0usize); n];
+        for i in 0..n {
+            let mut node = nodes[i].clone();
+            node.update_children(|c| id_of[usize::from(c)]);
+            id_of[i] = egraph
+                .lookup(node)
+                .expect("start node absent from egraph (invariant violated)");
+        }
+
+        // (2) Descend the outer ewmin tree from the root; its non-ewmin children are
+        //     the per-group ewmax-tree roots. Collect each group's ewmax leaves.
+        let root_idx = n - 1;
+        let mut group_roots: Vec<usize> = Vec::new();
+        let mut stack = vec![root_idx];
+        while let Some(i) = stack.pop() {
+            if matches!(nodes[i], Mdl::Ewmin(_)) {
+                for c in nodes[i].children() {
+                    stack.push(usize::from(*c));
+                }
+            } else {
+                group_roots.push(i);
+            }
+        }
+        group_roots.sort_unstable();
+        fn collect_max_leaves(nodes: &[Mdl], i: usize, out: &mut Vec<usize>) {
+            if let Mdl::Ewmax([a, b]) = nodes[i] {
+                collect_max_leaves(nodes, usize::from(a), out);
+                collect_max_leaves(nodes, usize::from(b), out);
+            } else {
+                out.push(i);
+            }
+        }
+        let groups: Vec<Vec<usize>> = group_roots
+            .iter()
+            .map(|&r| {
+                let mut v = Vec::new();
+                collect_max_leaves(nodes, r, &mut v);
+                v
+            })
+            .collect();
+        println!("query_chain: {} group(s)", groups.len());
+        for (gi, g) in groups.iter().enumerate() {
+            println!("query_chain:   group {} has {} ewmax leaves", gi, g.len());
+        }
+
+        // is this (canonical-children) enode on the cycle-filter blacklist?
+        let is_blacklisted = |eg: &EGraph<Mdl, TensorAnalysis>, mut node: Mdl| -> bool {
+            node.update_children(|id| eg.find(id));
+            eg.analysis.blacklist_nodes.contains(&node)
+        };
+
+        // (3a) natural-order chain per group: break depth = budget frontier.
+        let mut group_chain_id: Vec<Option<Id>> = Vec::new();
+        for (gi, g) in groups.iter().enumerate() {
+            let mut acc = id_of[g[0]];
+            let mut ok = true;
+            let mut bl = false;
+            for k in 1..g.len() {
+                let node = Mdl::Ewmax([acc, id_of[g[k]]]);
+                if is_blacklisted(&egraph, node.clone()) {
+                    bl = true;
+                }
+                match egraph.lookup(node) {
+                    Some(id) => acc = id,
+                    None => {
+                        println!(
+                            "query_chain: group {} natural-order chain BREAKS at depth {}/{}",
+                            gi,
+                            k,
+                            g.len() - 1
+                        );
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            if ok {
+                println!(
+                    "query_chain: group {} natural-order chain PRESENT (depth {}){}",
+                    gi,
+                    g.len() - 1,
+                    if bl { " [contains BLACKLISTED node]" } else { "" }
+                );
+                group_chain_id.push(Some(acc));
+            } else {
+                group_chain_id.push(None);
+            }
+        }
+
+        // (3b) order-INDEPENDENT subset closure per group: reach[mask] = set of class
+        //      ids realizable as SOME left-deep ewmax chain over exactly that leaf
+        //      subset. Full mask non-empty => a tight chain over all leaves EXISTS.
+        for (gi, g) in groups.iter().enumerate() {
+            let m = g.len();
+            if m == 0 || m > 16 {
+                println!("query_chain: group {} size {} not closed (skip)", gi, m);
+                continue;
+            }
+            let full = (1usize << m) - 1;
+            let mut reach: HashMap<usize, HashSet<Id>> = HashMap::new();
+            for j in 0..m {
+                let mut s = HashSet::new();
+                s.insert(egraph.find(id_of[g[j]]));
+                reach.insert(1 << j, s);
+            }
+            let mut masks: Vec<usize> = (1..=full).collect();
+            masks.sort_by_key(|mask| mask.count_ones());
+            for &mask in &masks {
+                if mask.count_ones() < 2 {
+                    continue;
+                }
+                let mut acc: HashSet<Id> = HashSet::new();
+                for j in 0..m {
+                    if mask & (1 << j) == 0 {
+                        continue;
+                    }
+                    let sub = mask & !(1 << j);
+                    if let Some(ids) = reach.get(&sub) {
+                        let leaf = egraph.find(id_of[g[j]]);
+                        let ids: Vec<Id> = ids.iter().copied().collect();
+                        for id in ids {
+                            for node in [Mdl::Ewmax([id, leaf]), Mdl::Ewmax([leaf, id])] {
+                                if let Some(r) = egraph.lookup(node) {
+                                    acc.insert(r);
+                                }
+                            }
+                        }
+                    }
+                }
+                if !acc.is_empty() {
+                    reach.insert(mask, acc);
+                }
+            }
+            match reach.get(&full) {
+                Some(ids) if !ids.is_empty() => println!(
+                    "query_chain: group {} -- SOME left-deep chain over all {} leaves EXISTS ({} class(es))",
+                    gi,
+                    m,
+                    ids.len()
+                ),
+                _ => println!(
+                    "query_chain: group {} -- NO left-deep chain over all {} leaves in e-graph",
+                    gi, m
+                ),
+            }
+        }
+
+        // (4) outer min over the natural-order group chains (both operand orders).
+        if group_chain_id.len() >= 2 && group_chain_id.iter().all(|x| x.is_some()) {
+            let a = group_chain_id[0].unwrap();
+            let b = group_chain_id[1].unwrap();
+            let mut found = None;
+            for node in [Mdl::Ewmin([a, b]), Mdl::Ewmin([b, a])] {
+                if let Some(id) = egraph.lookup(node) {
+                    found = Some(id);
+                    break;
+                }
+            }
+            match found {
+                Some(id) => println!(
+                    "query_chain: FULL natural-order chain lattice PRESENT, root-equivalent = {}",
+                    egraph.find(id) == egraph.find(root)
+                ),
+                None => println!("query_chain: group chains present but outer MIN node ABSENT"),
+            }
+        }
+        println!("query_chain: DONE (read the 'Stopped:' reason above for the budget verdict)");
     } else if let Some(n_random_str) = matches.value_of("n_random") {
         // Sample N egraph-equivalent graphs at random instead of extracting a
         // single best one -- see RandomCost/UniformRandomCost in optimize.rs

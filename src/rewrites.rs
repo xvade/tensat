@@ -1295,8 +1295,28 @@ impl MultiPatterns {
         // Check descendents of the input eclasses
         return input_ids.iter().all(|id| {
             let descendents = self.descendents.as_ref().unwrap();
-            let descendents_input = descendents.get(id).unwrap();
-            !descendents_input.contains(&out_class_1) && !descendents_input.contains(&out_class_2)
+            match descendents.get(id) {
+                Some(d) => !d.contains(&out_class_1) && !d.contains(&out_class_2),
+                None => {
+                    // The precomputed map (built at run_one start from root) may not
+                    // contain this input eclass -- e.g. a new/re-canonicalized eclass
+                    // created by an expanded (bidirectional) rule set. Recompute its
+                    // descendents on the fly rather than panic (or blindly reject,
+                    // which would silently suppress valid applications).
+                    let cid = egraph.find(*id);
+                    let id_to_class: HashMap<Id, &EClass<Mdl, ValTnsr>> =
+                        egraph.classes().map(|c| (c.id, c)).collect();
+                    if !id_to_class.contains_key(&cid) {
+                        return false; // truly unknown eclass -> conservatively reject
+                    }
+                    let mut local: HashMap<Id, HashSet<Id>> = Default::default();
+                    get_descendents(egraph, cid, &id_to_class, false, &mut local);
+                    match local.get(&cid) {
+                        Some(d) => !d.contains(&out_class_1) && !d.contains(&out_class_2),
+                        None => false,
+                    }
+                }
+            }
         });
     }
 }

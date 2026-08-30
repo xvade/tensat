@@ -29,7 +29,8 @@ def main():
             if r not in seen:
                 seen.add(r); rev.append(r)
     with open(out, 'w') as f:
-        f.write('\n'.join(fwd + rev) + '\n')
+        f.write('\n'.join(fwd + rev))  # NO trailing newline: main.rs splits on
+        # "\n" without filtering empties, so a trailing "" would panic "".parse()
     print(f"input rules: {n_in}")
     print(f"forward kept (deduped): {len(fwd)}")
     print(f"valid reverses added:   {len(rev)}")

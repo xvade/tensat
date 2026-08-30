@@ -305,6 +305,12 @@ pub struct VerifCost<'a> {
     pub egraph: &'a EGraph<Mdl, TensorAnalysis>,
     /// sorted leaf weight-name set -> element-wise (lo, hi) over the input box
     pub leaf_intervals: HashMap<Vec<String>, Interval>,
+    /// Optional per-node backward-CROWN sensitivity |lambda|, keyed by the node's
+    /// OUTPUT weight-name set (union of its operands' names -- identifies which
+    /// sub-function's ReLU this is). Weights the gap so the cost targets ReLUs whose
+    /// relaxation slack actually reaches the output (critical-path), not all equally.
+    /// Empty => all 1.0 (the unweighted VerifCost).
+    pub sensitivities: HashMap<Vec<String>, f32>,
     pub scale: f32,
     memo: std::cell::RefCell<HashMap<Id, Option<Interval>>>,
     visiting: std::cell::RefCell<HashSet<Id>>,
@@ -334,15 +340,34 @@ impl<'a> VerifCost<'a> {
     pub fn new(
         egraph: &'a EGraph<Mdl, TensorAnalysis>,
         leaf_intervals: HashMap<Vec<String>, Interval>,
+        sensitivities: HashMap<Vec<String>, f32>,
         scale: f32,
     ) -> Self {
         VerifCost {
             egraph,
             leaf_intervals,
+            sensitivities,
             scale,
             memo: std::cell::RefCell::new(HashMap::new()),
             visiting: std::cell::RefCell::new(HashSet::new()),
         }
+    }
+
+    /// Backward-CROWN sensitivity for the ReLU inside `ewmax/ewmin(u,v)`, keyed by
+    /// the node's OUTPUT weight-name set (= union of operands' names). 1.0 if no
+    /// sensitivity map is loaded or this node is unmeasured (falls back to unweighted).
+    fn node_sensitivity(&self, u: Id, v: Id) -> f32 {
+        if self.sensitivities.is_empty() {
+            return 1.0;
+        }
+        let mut wn: Vec<String> = self.egraph[self.egraph.find(u)]
+            .data
+            .weight_names
+            .union(&self.egraph[self.egraph.find(v)].data.weight_names)
+            .cloned()
+            .collect();
+        wn.sort();
+        self.sensitivities.get(&wn).copied().unwrap_or(1.0)
     }
 
     /// Tightest-over-forms interval of the function an e-class computes.
@@ -431,8 +456,10 @@ impl CostFunction<Mdl> for VerifCost<'_> {
     fn cost<C: FnMut(Id) -> Self::Cost>(&mut self, enode: &Mdl, mut costs: C) -> Self::Cost {
         const EPS: f32 = 1.0e-3; // op-count tie-breaker floor
         let self_cost = match enode {
-            Mdl::Ewmax([u, v]) => self.relu_gap(*v, *u) * self.scale + EPS, // relu(v-u)
-            Mdl::Ewmin([u, v]) => self.relu_gap(*u, *v) * self.scale + EPS, // relu(u-v)
+            // gap-area weighted by the ReLU's backward-CROWN sensitivity (1.0 if
+            // no sensitivity map loaded => the plain unweighted VerifCost).
+            Mdl::Ewmax([u, v]) => self.node_sensitivity(*u, *v) * self.relu_gap(*v, *u) * self.scale + EPS,
+            Mdl::Ewmin([u, v]) => self.node_sensitivity(*u, *v) * self.relu_gap(*u, *v) * self.scale + EPS,
             _ => EPS,
         };
         enode.fold(self_cost, |sum, id| sum + costs(id))

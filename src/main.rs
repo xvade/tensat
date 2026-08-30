@@ -310,6 +310,14 @@ fn main() {
                        element-wise IBP interval over the input box."),
         )
         .arg(
+            Arg::with_name("sensitivity_file")
+                .long("sensitivity_file")
+                .takes_value(true)
+                .help("Optional JSON for --verif_cost: {\"w_0,..,w_15\": 0.83, ..} mapping a \
+                       node's OUTPUT weight-name set to its backward-CROWN sensitivity \
+                       |lambda|, weighting that ReLU's gap. Omit => unweighted."),
+        )
+        .arg(
             Arg::with_name("weight_names_json")
                 .long("weight_names_json")
                 .takes_value(true)
@@ -777,8 +785,25 @@ fn optimize(matches: clap::ArgMatches) {
                 (names, (v.lo, v.hi))
             })
             .collect();
+        // Optional per-node backward-CROWN sensitivity weights (critical-path).
+        let sensitivities: HashMap<Vec<String>, f32> = match matches.value_of("sensitivity_file") {
+            Some(sf) => {
+                let raw: HashMap<String, f32> =
+                    serde_json::from_str(&read_to_string(sf).expect("read sensitivity_file"))
+                        .expect("parse sensitivity_file");
+                raw.into_iter()
+                    .map(|(k, w)| {
+                        let mut names: Vec<String> = k.split(',').map(|s| s.to_string()).collect();
+                        names.sort();
+                        (names, w)
+                    })
+                    .collect()
+            }
+            None => HashMap::new(),
+        };
+        println!("verif-cost: {} sensitivity weights loaded", sensitivities.len());
         let scale: f32 = 1.0e6; // one unstable ReLU dominates the op-count epsilon
-        let verif_cost = VerifCost::new(&egraph, leaf_intervals, scale);
+        let verif_cost = VerifCost::new(&egraph, leaf_intervals, sensitivities, scale);
         let (hit, total) = verif_cost.leaves_bound();
         println!(
             "verif-cost: {}/{} leaf intervals matched an e-class weight-name set",

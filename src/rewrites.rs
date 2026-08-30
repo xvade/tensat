@@ -1310,7 +1310,8 @@ impl MultiPatterns {
                         return false; // truly unknown eclass -> conservatively reject
                     }
                     let mut local: HashMap<Id, HashSet<Id>> = Default::default();
-                    get_descendents(egraph, cid, &id_to_class, false, &mut local);
+                    // match the precomputed map's check_blacklist=true (see run_one)
+                    get_descendents(egraph, cid, &id_to_class, true, &mut local);
                     match local.get(&cid) {
                         Some(d) => !d.contains(&out_class_1) && !d.contains(&out_class_2),
                         None => false,

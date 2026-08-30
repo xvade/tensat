@@ -271,6 +271,174 @@ impl CostFunction<Mdl> for ArchDiverseCost<'_> {
     }
 }
 
+/// Verifiability-aware extraction cost. Steers extraction toward the ReLU
+/// topology with the least total relaxation slack. Each `ewmax`/`ewmin` enode
+/// lowers (at reconstruction) to one ReLU -- `max(u,v)=u+relu(v-u)`,
+/// `min(u,v)=u-relu(u-v)` -- and we score it by the TRIANGLE RELAXATION AREA of
+/// that ReLU's pre-activation interval over the input box: a stable ReLU
+/// (pre-activation doesn't straddle 0) costs 0; an unstable one costs
+/// `-l*u/(u-l)` per element. Minimizing the summed gap-area => fewer/smaller
+/// unstable ReLUs => tighter certified bound (the mechanism measured on the
+/// maxout PoC: chain tighter <=> fewer unstable ReLUs).
+///
+/// DESIGN CHOICES (the "how"):
+/// - Intervals are computed LAZILY here at extraction time via a memoized
+///   recursive walk over the e-graph, NOT as an egg Analysis. Extraction runs
+///   after saturation so every enode exists; this sidesteps make/merge
+///   re-propagation entirely and lets us choose the per-class interval
+///   deliberately.
+/// - A class's interval is the INTERSECTION (tightest) over its enodes'
+///   computed intervals -- an *optimistic* score (the tightest any equivalent
+///   form achieves). For a steering heuristic this can only mis-rank, never
+///   break soundness (the numeric gate is independent).
+/// - Affine LEAF intervals are INJECTED from a sidecar keyed by the leaf's
+///   weight-name set: each affine map `W_k x + b_k` has a unique {weight,bias}
+///   name pair, and `ValTnsr.weight_names` already carries that provenance.
+///   Interior nodes get interval arithmetic from their children.
+/// - A None (unscoreable) child reads as WORST (large penalty), never free, so
+///   the extractor is not *attracted* to nodes it cannot score.
+/// - A tiny per-op epsilon tie-breaks so op-bloating bridge forms
+///   (`max=(a+b)-min` adds ewadd/ewsub) don't come out cost-free.
+pub type Interval = (Vec<f32>, Vec<f32>);
+
+pub struct VerifCost<'a> {
+    pub egraph: &'a EGraph<Mdl, TensorAnalysis>,
+    /// sorted leaf weight-name set -> element-wise (lo, hi) over the input box
+    pub leaf_intervals: HashMap<Vec<String>, Interval>,
+    pub scale: f32,
+    memo: std::cell::RefCell<HashMap<Id, Option<Interval>>>,
+    visiting: std::cell::RefCell<HashSet<Id>>,
+}
+
+fn iv_binop(a: &Interval, b: &Interval, f: impl Fn(f32, f32, f32, f32) -> (f32, f32)) -> Interval {
+    let n = a.0.len().min(b.0.len());
+    let (mut lo, mut hi) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    for i in 0..n {
+        let (l, u) = f(a.0[i], a.1[i], b.0[i], b.1[i]);
+        lo.push(l);
+        hi.push(u);
+    }
+    (lo, hi)
+}
+fn iv_intersect(a: &Interval, b: &Interval) -> Interval {
+    let n = a.0.len().min(b.0.len());
+    let (mut lo, mut hi) = (Vec::with_capacity(n), Vec::with_capacity(n));
+    for i in 0..n {
+        lo.push(a.0[i].max(b.0[i]));
+        hi.push(a.1[i].min(b.1[i]));
+    }
+    (lo, hi)
+}
+
+impl<'a> VerifCost<'a> {
+    pub fn new(
+        egraph: &'a EGraph<Mdl, TensorAnalysis>,
+        leaf_intervals: HashMap<Vec<String>, Interval>,
+        scale: f32,
+    ) -> Self {
+        VerifCost {
+            egraph,
+            leaf_intervals,
+            scale,
+            memo: std::cell::RefCell::new(HashMap::new()),
+            visiting: std::cell::RefCell::new(HashSet::new()),
+        }
+    }
+
+    /// Tightest-over-forms interval of the function an e-class computes.
+    fn class_interval(&self, id: Id) -> Option<Interval> {
+        let cid = self.egraph.find(id);
+        if let Some(v) = self.memo.borrow().get(&cid) {
+            return v.clone();
+        }
+        if self.visiting.borrow().contains(&cid) {
+            return None; // cycle guard
+        }
+        // Affine leaf? key by the class's weight-name set.
+        let mut wn: Vec<String> = self.egraph[cid].data.weight_names.iter().cloned().collect();
+        wn.sort();
+        if let Some(iv) = self.leaf_intervals.get(&wn) {
+            self.memo.borrow_mut().insert(cid, Some(iv.clone()));
+            return Some(iv.clone());
+        }
+        self.visiting.borrow_mut().insert(cid);
+        let nodes: Vec<Mdl> = self.egraph[cid].nodes.clone();
+        let mut best: Option<Interval> = None;
+        for enode in nodes.iter() {
+            if let Some(iv) = self.enode_interval(enode) {
+                best = Some(match best {
+                    None => iv,
+                    Some(b) => iv_intersect(&b, &iv),
+                });
+            }
+        }
+        self.visiting.borrow_mut().remove(&cid);
+        self.memo.borrow_mut().insert(cid, best.clone());
+        best
+    }
+
+    fn enode_interval(&self, enode: &Mdl) -> Option<Interval> {
+        match enode {
+            Mdl::Ewadd([a, b]) => Some(iv_binop(&self.class_interval(*a)?, &self.class_interval(*b)?, |la, ua, lb, ub| (la + lb, ua + ub))),
+            Mdl::Ewsub([a, b]) => Some(iv_binop(&self.class_interval(*a)?, &self.class_interval(*b)?, |la, ua, lb, ub| (la - ub, ua - lb))),
+            Mdl::Ewmax([a, b]) => Some(iv_binop(&self.class_interval(*a)?, &self.class_interval(*b)?, |la, ua, lb, ub| (la.max(lb), ua.max(ub)))),
+            Mdl::Ewmin([a, b]) => Some(iv_binop(&self.class_interval(*a)?, &self.class_interval(*b)?, |la, ua, lb, ub| (la.min(lb), ua.min(ub)))),
+            Mdl::Relu(a) => {
+                let (l, u) = self.class_interval(*a)?;
+                Some((l.iter().map(|x| x.max(0.0)).collect(), u.iter().map(|x| x.max(0.0)).collect()))
+            }
+            _ => None, // matmul/smul/input/etc. without a leaf key -> unknown
+        }
+    }
+
+    /// Summed triangle relaxation area of `relu(hi_operand - lo_operand)`.
+    /// Unscoreable (None child) reads as WORST so it can't attract the extractor.
+    fn relu_gap(&self, hi_operand: Id, lo_operand: Id) -> f32 {
+        match (self.class_interval(hi_operand), self.class_interval(lo_operand)) {
+            (Some((lh, uh)), Some((ll, ul))) => {
+                let mut g = 0.0f64;
+                for i in 0..lh.len().min(ll.len()) {
+                    let l = (lh[i] - ul[i]) as f64; // pre-activation lower
+                    let u = (uh[i] - ll[i]) as f64; // pre-activation upper
+                    if l < 0.0 && u > 0.0 {
+                        g += (-l * u) / (u - l);
+                    }
+                }
+                g as f32
+            }
+            _ => 1.0e6,
+        }
+    }
+
+    /// How many injected leaf keys actually match an e-class (the 16/16 check).
+    pub fn leaves_bound(&self) -> (usize, usize) {
+        let present: HashSet<Vec<String>> = self
+            .egraph
+            .classes()
+            .map(|c| {
+                let mut w: Vec<String> = c.data.weight_names.iter().cloned().collect();
+                w.sort();
+                w
+            })
+            .collect();
+        let hit = self.leaf_intervals.keys().filter(|k| present.contains(*k)).count();
+        (hit, self.leaf_intervals.len())
+    }
+}
+
+impl CostFunction<Mdl> for VerifCost<'_> {
+    type Cost = f32;
+    fn cost<C: FnMut(Id) -> Self::Cost>(&mut self, enode: &Mdl, mut costs: C) -> Self::Cost {
+        const EPS: f32 = 1.0e-3; // op-count tie-breaker floor
+        let self_cost = match enode {
+            Mdl::Ewmax([u, v]) => self.relu_gap(*v, *u) * self.scale + EPS, // relu(v-u)
+            Mdl::Ewmin([u, v]) => self.relu_gap(*u, *v) * self.scale + EPS, // relu(u-v)
+            _ => EPS,
+        };
+        enode.fold(self_cost, |sum, id| sum + costs(id))
+    }
+}
+
 /// Class for our cost model
 pub struct CostModel {
     /// To have zero cost for all weight op only

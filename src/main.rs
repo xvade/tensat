@@ -293,6 +293,23 @@ fn main() {
                        an uncovered family."),
         )
         .arg(
+            Arg::with_name("verif_cost")
+                .long("verif_cost")
+                .takes_value(false)
+                .help("Verifiability-aware extraction: one extraction minimizing the \
+                       summed ReLU relaxation gap-area (VerifCost in optimize.rs), \
+                       steering toward the ReLU topology with fewest/smallest unstable \
+                       ReLUs. Requires --interval_file. Exports {export}_verif.model."),
+        )
+        .arg(
+            Arg::with_name("interval_file")
+                .long("interval_file")
+                .takes_value(true)
+                .help("JSON for --verif_cost: {\"w_0,w_1\": {\"lo\":[..],\"hi\":[..]}, ..} \
+                       mapping each affine leaf's sorted weight-name set to its \
+                       element-wise IBP interval over the input box."),
+        )
+        .arg(
             Arg::with_name("weight_names_json")
                 .long("weight_names_json")
                 .takes_value(true)
@@ -737,6 +754,48 @@ fn optimize(matches: clap::ArgMatches) {
             if let Some(exportf) = matches.value_of("export_model") {
                 save_model_with_provenance(&runner_ext, &format!("{}_arch{}.model", exportf, i));
             }
+        }
+    } else if matches.is_present("verif_cost") {
+        // Verifiability-aware extraction: one extraction minimizing the summed
+        // ReLU relaxation gap-area (VerifCost in optimize.rs).
+        let interval_file = matches
+            .value_of("interval_file")
+            .expect("--verif_cost requires --interval_file");
+        #[derive(serde::Deserialize)]
+        struct IvJson {
+            lo: Vec<f32>,
+            hi: Vec<f32>,
+        }
+        let raw: HashMap<String, IvJson> =
+            serde_json::from_str(&read_to_string(interval_file).expect("read interval_file"))
+                .expect("parse interval_file");
+        let leaf_intervals: HashMap<Vec<String>, (Vec<f32>, Vec<f32>)> = raw
+            .into_iter()
+            .map(|(k, v)| {
+                let mut names: Vec<String> = k.split(',').map(|s| s.to_string()).collect();
+                names.sort();
+                (names, (v.lo, v.hi))
+            })
+            .collect();
+        let scale: f32 = 1.0e6; // one unstable ReLU dominates the op-count epsilon
+        let verif_cost = VerifCost::new(&egraph, leaf_intervals, scale);
+        let (hit, total) = verif_cost.leaves_bound();
+        println!(
+            "verif-cost: {}/{} leaf intervals matched an e-class weight-name set",
+            hit, total
+        );
+        let start_time = Instant::now();
+        let mut extractor = Extractor::new(&egraph, verif_cost);
+        let (best_cost, best) = extractor.find_best(root);
+        println!(
+            "verif-cost extraction: gap-cost {:?}, {} nodes, took {:?}",
+            best_cost,
+            best.as_ref().len(),
+            start_time.elapsed()
+        );
+        let runner_ext = Runner::<Mdl, TensorAnalysis, ()>::default().with_expr(&best);
+        if let Some(exportf) = matches.value_of("export_model") {
+            save_model_with_provenance(&runner_ext, &format!("{}_verif.model", exportf));
         }
     } else {
         // Run extraction

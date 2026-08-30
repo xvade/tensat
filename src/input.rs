@@ -184,6 +184,21 @@ impl GraphConverter {
         }
     }
 
+    pub fn sub(&mut self, inpt_1: TensorInfo, inpt_2: TensorInfo) -> TensorInfo {
+        let new_node = Mdl::Ewsub([inpt_1.id, inpt_2.id]);
+        TensorInfo { id: self.rec_expr.add(new_node), ..inpt_1 }
+    }
+
+    pub fn max(&mut self, inpt_1: TensorInfo, inpt_2: TensorInfo) -> TensorInfo {
+        let new_node = Mdl::Ewmax([inpt_1.id, inpt_2.id]);
+        TensorInfo { id: self.rec_expr.add(new_node), ..inpt_1 }
+    }
+
+    pub fn min(&mut self, inpt_1: TensorInfo, inpt_2: TensorInfo) -> TensorInfo {
+        let new_node = Mdl::Ewmin([inpt_1.id, inpt_2.id]);
+        TensorInfo { id: self.rec_expr.add(new_node), ..inpt_1 }
+    }
+
     pub fn matmul(&mut self, inpt_1: TensorInfo, inpt_2: TensorInfo) -> TensorInfo {
         let activation = ACTNONE;
         let act_id = self.add_or_get_val(activation);

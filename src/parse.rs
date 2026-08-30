@@ -139,6 +139,18 @@ vec![g.add(
                     nodes[&deps[0][0]][deps[0][1]],
                     nodes[&deps[1][0]][deps[1][1]],
                 )]},
+                OpType_OP_EW_SUB => vec![g.sub(
+                    nodes[&deps[0][0]][deps[0][1]],
+                    nodes[&deps[1][0]][deps[1][1]],
+                )],
+                OpType_OP_EW_MAX => vec![g.max(
+                    nodes[&deps[0][0]][deps[0][1]],
+                    nodes[&deps[1][0]][deps[1][1]],
+                )],
+                OpType_OP_EW_MIN => vec![g.min(
+                    nodes[&deps[0][0]][deps[0][1]],
+                    nodes[&deps[1][0]][deps[1][1]],
+                )],
                 OpType_OP_RELU => vec![g.relu(nodes[&deps[0][0]][deps[0][1]])],
                 OpType_OP_DROPOUT => vec![g.dropout(nodes[&deps[0][0]][deps[0][1]])],
                 OpType_OP_RESHAPE => vec![g.reshape(nodes[&deps[0][0]][deps[0][1]], &params)],

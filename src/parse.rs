@@ -114,13 +114,15 @@ fn parse_model_impl(rs_s: &str, guid_names: Option<&HashMap<usize, String>>) -> 
                 .next()
                 .unwrap()
                 .split(",")
+                .filter(|c_s| !c_s.is_empty())
                 .map(|c_s| c_s.split(":").map(|c| c.parse().unwrap()).collect())
                 .collect();
-            // parameters
+            // parameters (empty for paramless ops like elementwise max/min/sub/add)
             let params: Vec<i32> = ls
                 .next()
                 .unwrap()
                 .split(",")
+                .filter(|p_s| !p_s.is_empty())
                 .map(|p_s| p_s.parse().unwrap())
                 .collect();
             // node is really a vec, because split may return two outputs

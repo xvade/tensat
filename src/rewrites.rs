@@ -574,6 +574,36 @@ fn check_pat(
                         }
                     }
 
+                    Mdl::Ewsub([_a, _b]) | Mdl::Ewmax([_a, _b]) | Mdl::Ewmin([_a, _b]) => {
+                        let _a_data = &results[0].2;
+                        let _b_data = &results[1].2;
+                        assert!(_a_data.dtype == DataKind::Tnsr);
+                        assert!(_b_data.dtype == DataKind::Tnsr);
+                        let t_a = _a_data.tnsr.unwrap();
+                        let t_b = _b_data.tnsr.unwrap();
+                        let op_ty = match e {
+                            Mdl::Ewsub(_) => OpType_OP_EW_SUB,
+                            Mdl::Ewmax(_) => OpType_OP_EW_MAX,
+                            _ => OpType_OP_EW_MIN,
+                        };
+                        unsafe {
+                            let op = (*g.model).get_or_create_element(op_ty, &t_a, &t_b);
+                            if op == Op_INVALID_OP {
+                                let default_data: TData = Default::default();
+                                (false, None, default_data)
+                            } else {
+                                let t = (*op.ptr).outputs[0].clone();
+                                let t_data = TData {
+                                    dtype: DataKind::Tnsr,
+                                    val: 0,
+                                    tnsr: Some(t),
+                                    tnsr_2: None,
+                                };
+                                (true, None, t_data)
+                            }
+                        }
+                    }
+
                     Mdl::Ewmul([_a, _b]) => {
                         // Check types
                         let _a_data = &results[0].2;

@@ -381,7 +381,12 @@ fn optimize(matches: clap::ArgMatches) {
     let learned_rules =
         read_to_string(rule_file).expect("Something went wrong reading the rule file");
     let pre_defined_rules = PRE_DEFINED_RULES.iter().map(|&x| x);
-    let split_rules: Vec<&str> = learned_rules.split("\n").chain(pre_defined_rules).collect();
+    // filter empty lines (e.g. a trailing newline) -- they would panic "".parse()
+    let split_rules: Vec<&str> = learned_rules
+        .split("\n")
+        .filter(|l| !l.trim().is_empty())
+        .chain(pre_defined_rules)
+        .collect();
     let do_filter_after = no_cycle && filter_after;
     let rules = rules_from_str(split_rules, do_filter_after);
 
@@ -441,6 +446,7 @@ fn optimize(matches: clap::ArgMatches) {
         // The learned rules we have are symmetric. Predefined ones are not
         let multi_rules: Vec<(&str, bool)> = learned_rules
             .split("\n")
+            .filter(|l| !l.trim().is_empty())
             .map(|x| (x, /*symmetric=*/ true))
             .chain(pre_defined_multi)
             .collect();

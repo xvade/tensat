@@ -369,6 +369,7 @@ fn main() {
         "test" => test(matches),
         "convert" => convert_learned_rules(matches),
         "redundancy" => prune_redundant(matches),
+        "parse_check" => parse_check(matches),
         _ => panic!("Running mode not supported"),
     }
 }
@@ -1304,6 +1305,44 @@ fn save_model_with_provenance(runner: &Runner<Mdl, TensorAnalysis, ()>, file_nam
     let sidecar_path = format!("{}.weight_names.json", file_name);
     let json = serde_json::to_string_pretty(&entries).expect("failed to serialize weight_names sidecar");
     write(&sidecar_path, json).expect("failed to write weight_names sidecar");
+}
+
+/// --mode parse_check: the authoritative oracle for whether a rule is in a form
+/// current tensat accepts. Reads a rules file (one `lhs=>rhs` per line) and reports,
+/// per line, whether BOTH sides parse as `Pattern<Mdl>` (the exact parser
+/// `rules_from_str` uses). Used to settle each op's egg arity/child-order when
+/// extending pb2egg, and as the core assertion of the parse-validity regression test.
+/// Prints "OK <rule>" / "FAIL <rule>" per line and a final summary; exit code is
+/// nonzero iff any line failed.
+fn parse_check(matches: clap::ArgMatches) {
+    let file = matches.value_of("rules").expect("Pls supply a rules file.");
+    let text = read_to_string(file).expect("reading rules file");
+    let mut ok = 0usize;
+    let mut fail = 0usize;
+    for line in text.lines() {
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+        let mut it = l.splitn(2, "=>");
+        let lhs = it.next().unwrap().trim();
+        let rhs = it.next();
+        let lhs_ok = lhs.parse::<Pattern<Mdl>>().is_ok();
+        let rhs_ok = rhs
+            .map(|r| r.trim().parse::<Pattern<Mdl>>().is_ok())
+            .unwrap_or(false);
+        if lhs_ok && rhs_ok {
+            ok += 1;
+            println!("OK   {}", l);
+        } else {
+            fail += 1;
+            println!("FAIL {} (lhs_ok={} rhs_ok={})", l, lhs_ok, rhs_ok);
+        }
+    }
+    println!("parse_check: {} OK, {} FAIL", ok, fail);
+    if fail > 0 {
+        std::process::exit(1);
+    }
 }
 
 fn prove_taso_rules(matches: clap::ArgMatches) {

@@ -18,42 +18,60 @@ pub fn rules<A: Analysis<Mdl>>() -> Vec<Rewrite<Mdl, A>> { vec![
         rw!("smul-is-associative"             ; "(smul (smul ?x ?y) ?w) "                                               => "(smul ?x  (smul ?y ?w))"),
         rw!("distributivity-1"                ; "(smul (ewadd ?x ?y) ?w) "                                              => "(ewadd (smul ?x ?w)  (smul ?y ?w))"),
         rw!("operator-commutativity-0"        ; "(smul (ewmul ?x ?y) ?w) "                                              => "(ewmul ?x  (smul ?y ?w))"),
-        rw!("transpose-is-its-own-inverse"    ; "(transpose (transpose ?x)) "                                           => "?x"),
-        rw!("operator-commutativity-1"        ; "(transpose (ewadd ?x ?y)) "                                            => "(ewadd (transpose ?x)  (transpose ?y))"),
-        rw!("operator-commutativity-2"        ; "(transpose (ewmul ?x ?y)) "                                            => "(ewmul (transpose ?x)  (transpose ?y))"),
-        rw!("operator-commutativity-3"        ; "(smul (transpose ?x) ?w) "                                             => "(transpose (smul ?x ?w))"),
-        rw!("matmul-is-associative"           ; "(matmul ?x (matmul ?y ?z)) "                                           => "(matmul (matmul ?x ?y) ?z)"),
-        rw!("matmul-is-linear-0"              ; "(smul (matmul ?x ?y) ?w) "                                             => "(matmul ?x  (smul ?y ?w))"),
-        rw!("matmul-is-linear-1"              ; "(matmul ?x (ewadd ?y ?z)) "                                            => "(ewadd (matmul ?x ?y) (matmul ?x ?z))"),
-        rw!("matmul-and-transpose"            ; "(transpose (matmul ?x ?y)) "                                           => "(matmul (transpose ?y)  (transpose ?x))"),
+        // --- MIGRATED to current Mdl arities (2026-08-31; see rules() header note). These axioms were
+        //     written in 2020 against the old op arities (2-arg matmul, 1-arg transpose, 3-arg concat,
+        //     6-arg params-first pool). The Mdl language grew params afterward but rules() -- verify-only,
+        //     off by default -- was never updated, so it panicked at pattern-parse. verify() is PURE-EGG
+        //     (analysis=()), so an axiom only needs to PARSE and be a TRUE universal identity; Name/Scalar
+        //     leaves (transpose perm/shuffle, concat ndim) are written as free pattern vars.
+        //     Five families are DROPPED, not migrated, because they cannot be stated soundly here:
+        //       transpose-is-its-own-inverse / matmul-and-transpose / concatenation-and-transpose
+        //         -- 2D-transpose / involution-specific; a free perm ?p asserts them for ALL perms (false),
+        //            and a literal perm symbol would never match a generated rule.
+        //       split-definition-0/1  -- split_0/1 are now UNARY (take a split node); the old binary form is
+        //         arity-broken, and split-of-concat only equals the pieces when split points match sizes.
+        //       enlarge-convolution-kernel -- enlarge is now 2-arg ref-based, not 3-arg kernel-based; no
+        //         faithful translation without pinning padding semantics. ---
+        // transpose = [input, perm_name, shuffle]; distribution over elementwise holds for ANY perm (free ?p ?s).
+        rw!("operator-commutativity-1"        ; "(transpose (ewadd ?x ?y) ?p ?s) "                                      => "(ewadd (transpose ?x ?p ?s)  (transpose ?y ?p ?s))"),
+        rw!("operator-commutativity-2"        ; "(transpose (ewmul ?x ?y) ?p ?s) "                                      => "(ewmul (transpose ?x ?p ?s)  (transpose ?y ?p ?s))"),
+        rw!("operator-commutativity-3"        ; "(smul (transpose ?x ?p ?s) ?w) "                                       => "(transpose (smul ?x ?w) ?p ?s)"),
+        // matmul = [activation, in1, in2]; linearity/assoc hold only for activation=0 (no relu) -> literal 0.
+        rw!("matmul-is-associative"           ; "(matmul 0 ?x (matmul 0 ?y ?z)) "                                       => "(matmul 0 (matmul 0 ?x ?y) ?z)"),
+        rw!("matmul-is-linear-0"              ; "(smul (matmul 0 ?x ?y) ?w) "                                           => "(matmul 0 ?x  (smul ?y ?w))"),
+        rw!("matmul-is-linear-1"              ; "(matmul 0 ?x (ewadd ?y ?z)) "                                          => "(ewadd (matmul 0 ?x ?y) (matmul 0 ?x ?z))"),
+        // matmul activation-unfold: couldn't exist in 2020 (matmul had no acti). acti 2 = relu; definitionally sound.
+        rw!("matmul-with-2-applies-relu"      ; "(matmul 2 ?x ?y) "                                                     => "(relu (matmul 0 ?x ?y))"),
         rw!("conv-is-bilinear-0"              ; "(conv2d ?sx ?sy ?p ?c (smul ?x ?w) ?y) "                               => "(conv2d ?sx ?sy ?p ?c ?x (smul ?y ?w))"),
         rw!("conv-is-bilinear-1"              ; "(smul (conv2d ?sx ?sy ?p 0 ?x ?y) ?w) "                            => "(conv2d ?sx ?sy ?p 0 (smul ?x ?w) ?y)"),
         rw!("conv-is-bilinear-2"              ; "(conv2d ?sx ?sy ?p 0 ?x (ewadd ?y ?z)) "                           => "(ewadd (conv2d ?sx ?sy ?p 0 ?x ?y) (conv2d ?sx ?sy ?p 0 ?x ?z))"),
         rw!("conv-is-bilinear-3"              ; "(conv2d ?sx ?sy ?p 0 (ewadd ?x ?y) ?z) "                           => "(ewadd (conv2d ?sx ?sy ?p 0 ?x ?z) (conv2d ?sx ?sy ?p 0 ?y ?z))"),
         //rw!("enlarge-convolution-kernel"      ; "(conv2d ?sx ?sy 0 ?c ?x ?y) "                                      => "(conv2d ?sx ?sy 0 ?c ?x (enlarge ?kx ?ky ?y))"),
         rw!("operator-commutativity-4"        ; "(conv2d ?sx ?sy ?p 2 ?x ?y) "                                      => "(relu (conv2d ?sx ?sy ?p 0 ?x ?y))"),
-        rw!("conv-with-2-applies-relu"    ; "(relu (transpose ?x)) "                                                => "(transpose (relu ?x))"),
-        // rw!("pooling-by-conv.-with-Cpool"     ; "(conv2d ?sx ?sy ?p 0 ?x (Cpool ?kx ?ky)) "                              => "(poolavg ?kx ?ky ?sx ?sy ?p ?x)"),
-        rw!("const_iconv-and-const_pool"      ; "(poolavg ?kx ?ky 1 1 0 (Iconv ?kx ?ky)) "                              => "(Cpool ?kx ?ky)"),
+        rw!("conv-with-2-applies-relu"    ; "(relu (transpose ?x ?p ?s)) "                                          => "(transpose (relu ?x) ?p ?s)"),
+        // pool = [input, kh, kw, sh, sw, pad, acti] (INPUT-first now). avgpool==conv (Cpool/pooling-by-conv)
+        // holds only with NO activation -> literal 0 there; concat-distribution rules keep a free ?c.
+        // rw!("pooling-by-conv.-with-Cpool"     ; "(conv2d ?sx ?sy ?p 0 ?x (Cpool ?kx ?ky)) "                              => "(poolavg (Iconv ?kx ?ky) ?kx ?ky ?sx ?sy ?p 0)"),
+        rw!("const_iconv-and-const_pool"      ; "(poolavg (Iconv ?kx ?ky) ?kx ?ky 1 1 0 0) "                            => "(Cpool ?kx ?ky)"),
         rw!("identity-kernel"                 ; "(conv2d 1 1 0 0 ?x (Iconv ?kx ?ky)) "                               => "?x"),
-        rw!("identity-matrix"                 ; "(matmul ?x   Imatmul ) "                                               => "?x"),
+        rw!("identity-matrix"                 ; "(matmul 0 ?x   Imatmul ) "                                             => "?x"),
         rw!("ewmul-identity"                  ; "(ewmul ?x Iewmul) "                                                    => "?x"),
-        rw!("split-definition-0"              ; "(split_0 ?a (concat ?a ?x ?y)) "                                       => "?x"),
-        rw!("split-definition-1"              ; "(split_1 ?a (concat ?a ?x ?y)) "                                       => "?y"),
-        rw!("geometry-of-concatenation"       ; "(concat 0 (concat 1 ?x ?y) (concat 1 ?z ?w)) "                         => "(concat 1 (concat 0 ?x ?z) (concat 0 ?y ?w))"),
-        rw!("operator-commutativity-5"        ; "(concat ?a (smul ?x ?w) (smul ?y ?w)) "                                => "(smul (concat ?a ?x ?y) ?w)"),
-        rw!("operator-commutativity-6"        ; "(concat ?a (ewadd ?x ?y) (ewadd ?z ?w)) "                              => "(ewadd (concat ?a ?x ?z) (concat ?a ?y ?w))"),
-        rw!("operator-commutativity-7"        ; "(concat ?a (ewmul ?x ?y) (ewmul ?z ?w)) "                              => "(ewmul (concat ?a ?x ?z) (concat ?a ?y ?w))"),
-        rw!("operator-commutativity-8"        ; "(concat ?a (relu ?x) (relu ?y)) "                                      => "(relu (concat ?a ?x ?y))"),
-        rw!("concatenation-and-transpose"     ; "(concat 1 (transpose ?x) (transpose ?y)) "                             => "(transpose (concat 0 ?x ?y))"),
-        rw!("concatenation-and-matrix-mul.-0" ; "(concat 1 (matmul ?x ?y) (matmul ?x ?z)) "                             => "(matmul ?x (concat 1 ?y ?z))"),
-        rw!("concatenation-and-matrix-mul.-1" ; "(matmul (concat 1 ?x ?z) (concat 0 ?y ?w)) "                           => "(ewadd (matmul ?x ?y) (matmul ?z ?w))"),
-        rw!("concatenation-and-conv.-0"       ; "(concat 0 (conv2d ?sx ?sy ?p ?c ?x ?z) (conv2d ?sx ?sy ?p ?c ?y ?z)) " => "(conv2d ?sx ?sy ?p ?c (concat 0 ?x ?y) ?z)"),
-        rw!("concatenation-and-conv.-1"       ; "(concat 1 (conv2d ?sx ?sy ?p ?c ?x ?y) (conv2d ?sx ?sy ?p ?c ?x ?z)) " => "(conv2d ?sx ?sy ?p ?c ?x (concat 0 ?y ?z))"),
-        rw!("concatenation-and-conv.-2"       ; "(conv2d ?sx ?sy ?p 0 (concat 1 ?x ?z) (concat 1 ?y ?w)) "          => "(ewadd (conv2d ?sx ?sy ?p 0 ?x ?y) (conv2d ?sx ?sy ?p 0 ?z ?w))"),
-        rw!("concatenation-and-pooling-0"     ; "(concat 1 (poolavg ?kx ?ky ?sx ?sy ?p ?x) (poolavg ?kx ?ky ?sx ?sy ?p ?y)) "               => "(poolavg ?kx ?ky ?sx ?sy ?p (concat 1 ?x ?y))"),
-        rw!("concatenation-and-pooling-1"     ; "(concat 0 (poolmax ?kx ?ky ?sx ?sy ?p ?x) (poolmax ?kx ?ky ?sx ?sy ?p ?y)) "               => "(poolmax ?kx ?ky ?sx ?sy ?p (concat 0 ?x ?y))"),
-        rw!("concatenation-and-pooling-2"     ; "(concat 1 (poolmax ?kx ?ky ?sx ?sy ?p ?x) (poolmax ?kx ?ky ?sx ?sy ?p ?y)) "               => "(poolmax ?kx ?ky ?sx ?sy ?p (concat 1 ?x ?y))"),
+        // DROPPED: split-definition-0/1 (arity-broken + conditional; see header note).
+        // concat = [axis, ndim, in1, in2]; ndim is a free var ?n (identity holds for any rank; concat preserves rank).
+        rw!("geometry-of-concatenation"       ; "(concat 0 ?n (concat 1 ?n ?x ?y) (concat 1 ?n ?z ?w)) "                => "(concat 1 ?n (concat 0 ?n ?x ?z) (concat 0 ?n ?y ?w))"),
+        rw!("operator-commutativity-5"        ; "(concat ?a ?n (smul ?x ?w) (smul ?y ?w)) "                             => "(smul (concat ?a ?n ?x ?y) ?w)"),
+        rw!("operator-commutativity-6"        ; "(concat ?a ?n (ewadd ?x ?y) (ewadd ?z ?w)) "                           => "(ewadd (concat ?a ?n ?x ?z) (concat ?a ?n ?y ?w))"),
+        rw!("operator-commutativity-7"        ; "(concat ?a ?n (ewmul ?x ?y) (ewmul ?z ?w)) "                           => "(ewmul (concat ?a ?n ?x ?z) (concat ?a ?n ?y ?w))"),
+        rw!("operator-commutativity-8"        ; "(concat ?a ?n (relu ?x) (relu ?y)) "                                   => "(relu (concat ?a ?n ?x ?y))"),
+        // DROPPED: concatenation-and-transpose (2D-transpose-specific; see header note).
+        rw!("concatenation-and-matrix-mul.-0" ; "(concat 1 ?n (matmul 0 ?x ?y) (matmul 0 ?x ?z)) "                      => "(matmul 0 ?x (concat 1 ?n ?y ?z))"),
+        rw!("concatenation-and-matrix-mul.-1" ; "(matmul 0 (concat 1 ?n ?x ?z) (concat 0 ?n ?y ?w)) "                   => "(ewadd (matmul 0 ?x ?y) (matmul 0 ?z ?w))"),
+        rw!("concatenation-and-conv.-0"       ; "(concat 0 ?n (conv2d ?sx ?sy ?p ?c ?x ?z) (conv2d ?sx ?sy ?p ?c ?y ?z)) " => "(conv2d ?sx ?sy ?p ?c (concat 0 ?n ?x ?y) ?z)"),
+        rw!("concatenation-and-conv.-1"       ; "(concat 1 ?n (conv2d ?sx ?sy ?p ?c ?x ?y) (conv2d ?sx ?sy ?p ?c ?x ?z)) " => "(conv2d ?sx ?sy ?p ?c ?x (concat 0 ?n ?y ?z))"),
+        rw!("concatenation-and-conv.-2"       ; "(conv2d ?sx ?sy ?p 0 (concat 1 ?n ?x ?z) (concat 1 ?n ?y ?w)) "    => "(ewadd (conv2d ?sx ?sy ?p 0 ?x ?y) (conv2d ?sx ?sy ?p 0 ?z ?w))"),
+        rw!("concatenation-and-pooling-0"     ; "(concat 1 ?n (poolavg ?x ?kx ?ky ?sx ?sy ?p ?c) (poolavg ?y ?kx ?ky ?sx ?sy ?p ?c)) "       => "(poolavg (concat 1 ?n ?x ?y) ?kx ?ky ?sx ?sy ?p ?c)"),
+        rw!("concatenation-and-pooling-1"     ; "(concat 0 ?n (poolmax ?x ?kx ?ky ?sx ?sy ?p ?c) (poolmax ?y ?kx ?ky ?sx ?sy ?p ?c)) "       => "(poolmax (concat 0 ?n ?x ?y) ?kx ?ky ?sx ?sy ?p ?c)"),
+        rw!("concatenation-and-pooling-2"     ; "(concat 1 ?n (poolmax ?x ?kx ?ky ?sx ?sy ?p ?c) (poolmax ?y ?kx ?ky ?sx ?sy ?p ?c)) "       => "(poolmax (concat 1 ?n ?x ?y) ?kx ?ky ?sx ?sy ?p ?c)"),
         // inverse
         rw!("-ewadd-is-associative"            ;"(ewadd (ewadd ?x ?y) ?z)"                                                => "(ewadd ?x (ewadd ?y ?z)) "                                             ),
         rw!("-ewadd-is-commutative"            ;"(ewadd ?y ?x)"                                                           => "(ewadd ?x ?y) "                                                        ),
@@ -63,44 +81,47 @@ pub fn rules<A: Analysis<Mdl>>() -> Vec<Rewrite<Mdl, A>> { vec![
         rw!("-smul-is-associative"             ;"(smul ?x  (smul ?y ?w))"                                                 => "(smul (smul ?x ?y) ?w) "                                               ),
         rw!("-distributivity-1"                ;"(ewadd (smul ?x ?w)  (smul ?y ?w))"                                      => "(smul (ewadd ?x ?y) ?w) "                                              ),
         rw!("-operator-commutativity-0"        ;"(ewmul ?x  (smul ?y ?w))"                                                => "(smul (ewmul ?x ?y) ?w) "                                              ),
-        rw!("-transpose-is-its-own-inverse"    ;"?x"                                                                      => "(transpose (transpose ?x)) "                                           ),
-        rw!("-operator-commutativity-1"        ;"(ewadd (transpose ?x)  (transpose ?y))"                                  => "(transpose (ewadd ?x ?y)) "                                            ),
-        rw!("-operator-commutativity-2"        ;"(ewmul (transpose ?x)  (transpose ?y))"                                  => "(transpose (ewmul ?x ?y)) "                                            ),
-        rw!("-operator-commutativity-3"        ;"(transpose (smul ?x ?w))"                                                => "(smul (transpose ?x) ?w) "                                             ),
-        rw!("-matmul-is-associative"           ;"(matmul (matmul ?x ?y) ?z)"                                              => "(matmul ?x (matmul ?y ?z)) "                                           ),
-        rw!("-matmul-is-linear-0"              ;"(matmul ?x  (smul ?y ?w))"                                               => "(smul (matmul ?x ?y) ?w) "                                             ),
-        rw!("-matmul-is-linear-1"              ;"(ewadd (matmul ?x ?y) (matmul ?x ?z))"                                   => "(matmul ?x (ewadd ?y ?z)) "                                            ),
-        rw!("-matmul-and-transpose"            ;"(matmul (transpose ?y)  (transpose ?x))"                                 => "(transpose (matmul ?x ?y)) "                                           ),
+        // DROPPED inverse: -transpose-is-its-own-inverse, -matmul-and-transpose (see forward-block header note).
+        rw!("-operator-commutativity-1"        ;"(ewadd (transpose ?x ?p ?s)  (transpose ?y ?p ?s))"                      => "(transpose (ewadd ?x ?y) ?p ?s) "                                      ),
+        rw!("-operator-commutativity-2"        ;"(ewmul (transpose ?x ?p ?s)  (transpose ?y ?p ?s))"                      => "(transpose (ewmul ?x ?y) ?p ?s) "                                      ),
+        rw!("-operator-commutativity-3"        ;"(transpose (smul ?x ?w) ?p ?s)"                                          => "(smul (transpose ?x ?p ?s) ?w) "                                       ),
+        rw!("-matmul-is-associative"           ;"(matmul 0 (matmul 0 ?x ?y) ?z)"                                          => "(matmul 0 ?x (matmul 0 ?y ?z)) "                                       ),
+        rw!("-matmul-is-linear-0"              ;"(matmul 0 ?x  (smul ?y ?w))"                                             => "(smul (matmul 0 ?x ?y) ?w) "                                           ),
+        rw!("-matmul-is-linear-1"              ;"(ewadd (matmul 0 ?x ?y) (matmul 0 ?x ?z))"                               => "(matmul 0 ?x (ewadd ?y ?z)) "                                          ),
+        rw!("-matmul-with-2-applies-relu"      ;"(relu (matmul 0 ?x ?y))"                                                 => "(matmul 2 ?x ?y) "                                                     ),
         rw!("-conv-is-bilinear-0"              ;"(conv2d ?sx ?sy ?p ?c ?x (smul ?y ?w))"                                  => "(conv2d ?sx ?sy ?p ?c (smul ?x ?w) ?y) "                               ),
         rw!("-conv-is-bilinear-1"              ;"(conv2d ?sx ?sy ?p 0 (smul ?x ?w) ?y)"                               => "(smul (conv2d ?sx ?sy ?p 0 ?x ?y) ?w) "                            ),
         rw!("-conv-is-bilinear-2"              ;"(ewadd (conv2d ?sx ?sy ?p 0 ?x ?y) (conv2d ?sx ?sy ?p 0 ?x ?z))" => "(conv2d ?sx ?sy ?p 0 ?x (ewadd ?y ?z)) "                           ),
         rw!("-conv-is-bilinear-3"              ;"(ewadd (conv2d ?sx ?sy ?p 0 ?x ?z) (conv2d ?sx ?sy ?p 0 ?y ?z))" => "(conv2d ?sx ?sy ?p 0 (ewadd ?x ?y) ?z) "                           ),
-        rw!("-enlarge-convolution-kernel"      ;"(conv2d ?sx ?sy 0 ?c ?x (enlarge ?kx ?ky ?y))"                            => "(conv2d ?sx ?sy 0 ?c ?x ?y) "                                      ),
+        // DROPPED inverse: -enlarge-convolution-kernel (enlarge is 2-arg ref-based now; no faithful form).
         rw!("-operator-commutativity-4"        ;"(relu (conv2d ?sx ?sy ?p 0 ?x ?y))"                                  => "(conv2d ?sx ?sy ?p 2 ?x ?y) "                                      ),
-        rw!("-conv-with-2-applies-relu"    ;"(transpose (relu ?x))"                                                   => "(relu (transpose ?x)) "                                                ),
-        rw!("-pooling-by-conv.-with-Cpool"     ;"(poolavg ?kx ?ky ?sx ?sy ?p ?x)"                                                   => "(conv2d ?sx ?sy ?p 0 ?x (Cpool ?kx ?ky)) "                              ),
-        rw!("-const_iconv-and-const_pool"      ;"(Cpool ?kx ?ky)"                              => "(poolavg ?kx ?ky 1 1 0 (Iconv ?kx ?ky))"),
+        rw!("-conv-with-2-applies-relu"    ;"(transpose (relu ?x) ?p ?s)"                                             => "(relu (transpose ?x ?p ?s)) "                                          ),
+        rw!("-pooling-by-conv.-with-Cpool"     ;"(poolavg ?x ?kx ?ky ?sx ?sy ?p 0)"                                                 => "(conv2d ?sx ?sy ?p 0 ?x (Cpool ?kx ?ky)) "                              ),
+        rw!("-const_iconv-and-const_pool"      ;"(Cpool ?kx ?ky)"                              => "(poolavg (Iconv ?kx ?ky) ?kx ?ky 1 1 0 0)"),
         // rw!("-identity-kernel"                 ;"?x"                                                                      => "(conv2d 1 1 0 0 ?x (Iconv ?k)) "                               ),
-        rw!("-identity-matrix"                 ;"?x"                                                                      => "(matmul ?x   Imatmul ) "                                               ),
+        rw!("-identity-matrix"                 ;"?x"                                                                      => "(matmul 0 ?x   Imatmul ) "                                             ),
         rw!("-ewmul-identity"                  ;"?x"                                                                      => "(ewmul ?x Iewmul) "                                                    ),
         // rw!("-split-definition-00"              ;"?x"                                                                      => "(split_0 1 (concat 1 ?x ?y)) "                                       ),
         // rw!("-split-definition-01"              ;"?x"                                                                      => "(split_0 0 (concat 0 ?x ?y)) "                                       ),
         // rw!("-split-definition-10"              ;"?y"                                                                      => "(split_1 0 (concat 0 ?x ?y)) "                                       ),
         // rw!("-split-definition-11"              ;"?y"                                                                      => "(split_1 1 (concat 1 ?x ?y)) "                                       ),
-        rw!("-geometry-of-concatenation"       ;"(concat 1 (concat 0 ?x ?z) (concat 0 ?y ?w))"                            => "(concat 0 (concat 1 ?x ?y) (concat 1 ?z ?w)) "                         ),
-        rw!("-operator-commutativity-5"        ;"(smul (concat ?a ?x ?y) ?w)"                                             => "(concat ?a (smul ?x ?w) (smul ?y ?w)) "                                ),
-        rw!("-operator-commutativity-6"        ;"(ewadd (concat ?a ?x ?z) (concat ?a ?y ?w))"                             => "(concat ?a (ewadd ?x ?y) (ewadd ?z ?w)) "                              ),
-        rw!("-operator-commutativity-7"        ;"(ewmul (concat ?a ?x ?z) (concat ?a ?y ?w))"                             => "(concat ?a (ewmul ?x ?y) (ewmul ?z ?w)) "                              ),
-        rw!("-operator-commutativity-8"        ;"(relu (concat ?a ?x ?y))"                                                => "(concat ?a (relu ?x) (relu ?y)) "                                      ),
-        rw!("-concatenation-and-transpose"     ;"(transpose (concat 0 ?x ?y))"                                            => "(concat 1 (transpose ?x) (transpose ?y)) "                             ),
-        rw!("-concatenation-and-matrix-mul.-0" ;"(matmul ?x (concat 1 ?y ?z))"                                            => "(concat 1 (matmul ?x ?y) (matmul ?x ?z)) "                             ),
-        rw!("-concatenation-and-matrix-mul.-1" ;"(ewadd (matmul ?x ?y) (matmul ?z ?w))"                                   => "(matmul (concat 1 ?x ?z) (concat 0 ?y ?w)) "                           ),
-        rw!("-concatenation-and-conv.-0"       ;"(conv2d ?sx ?sy ?p ?c (concat 0 ?x ?y) ?z)"                              => "(concat 0 (conv2d ?sx ?sy ?p ?c ?x ?z) (conv2d ?sx ?sy ?p ?c ?y ?z)) " ),
-        rw!("-concatenation-and-conv.-1"       ;"(conv2d ?sx ?sy ?p ?c ?x (concat 0 ?y ?z))"                              => "(concat 1 (conv2d ?sx ?sy ?p ?c ?x ?y) (conv2d ?sx ?sy ?p ?c ?x ?z)) " ),
-        rw!("-concatenation-and-conv.-2"       ;"(ewadd (conv2d ?sx ?sy ?p 0 ?x ?y) (conv2d ?sx ?sy ?p 0 ?z ?w))" => "(conv2d ?sx ?sy ?p 0 (concat 1 ?x ?z) (concat 1 ?y ?w)) "          ),
-        rw!("-concatenation-and-pooling-0"     ;"(poolavg ?kx ?ky ?sx ?sy ?p (concat 1 ?x ?y))"                                     => "(concat 1 (poolavg ?kx ?ky ?sx ?sy ?p ?x) (poolavg ?kx ?ky ?sx ?sy ?p ?y)) "               ),
-        rw!("-concatenation-and-pooling-1"     ;"(poolmax ?kx ?ky ?sx ?sy ?p (concat 0 ?x ?y))"                                     => "(concat 0 (poolmax ?kx ?ky ?sx ?sy ?p ?x) (poolmax ?kx ?ky ?sx ?sy ?p ?y)) "               ),
-        rw!("-concatenation-and-pooling-2"     ;"(poolmax ?kx ?ky ?sx ?sy ?p (concat 1 ?x ?y))"                                     => "(concat 1 (poolmax ?kx ?ky ?sx ?sy ?p ?x) (poolmax ?kx ?ky ?sx ?sy ?p ?y)) "               ),
+        rw!("-geometry-of-concatenation"       ;"(concat 1 ?n (concat 0 ?n ?x ?z) (concat 0 ?n ?y ?w))"                   => "(concat 0 ?n (concat 1 ?n ?x ?y) (concat 1 ?n ?z ?w)) "                 ),
+        rw!("-operator-commutativity-5"        ;"(smul (concat ?a ?n ?x ?y) ?w)"                                          => "(concat ?a ?n (smul ?x ?w) (smul ?y ?w)) "                             ),
+        rw!("-operator-commutativity-6"        ;"(ewadd (concat ?a ?n ?x ?z) (concat ?a ?n ?y ?w))"                       => "(concat ?a ?n (ewadd ?x ?y) (ewadd ?z ?w)) "                           ),
+        rw!("-operator-commutativity-7"        ;"(ewmul (concat ?a ?n ?x ?z) (concat ?a ?n ?y ?w))"                       => "(concat ?a ?n (ewmul ?x ?y) (ewmul ?z ?w)) "                           ),
+        rw!("-operator-commutativity-8"        ;"(relu (concat ?a ?n ?x ?y))"                                             => "(concat ?a ?n (relu ?x) (relu ?y)) "                                   ),
+        // DROPPED inverse: -concatenation-and-transpose (2D-transpose-specific; see header note).
+        rw!("-concatenation-and-matrix-mul.-0" ;"(matmul 0 ?x (concat 1 ?n ?y ?z))"                                       => "(concat 1 ?n (matmul 0 ?x ?y) (matmul 0 ?x ?z)) "                       ),
+        // DROPPED inverse: -concatenation-and-matrix-mul.-1 -- the RHS reintroduces a concat whose rank ?n
+        //   is NOT bound by the ewadd LHS (ndim is unrecoverable from the elementwise side), so egg rejects
+        //   the unbound RHS var. The FORWARD (matmul-of-concat => ewadd) is kept; only this direction is lost.
+        rw!("-concatenation-and-conv.-0"       ;"(conv2d ?sx ?sy ?p ?c (concat 0 ?n ?x ?y) ?z)"                           => "(concat 0 ?n (conv2d ?sx ?sy ?p ?c ?x ?z) (conv2d ?sx ?sy ?p ?c ?y ?z)) " ),
+        rw!("-concatenation-and-conv.-1"       ;"(conv2d ?sx ?sy ?p ?c ?x (concat 0 ?n ?y ?z))"                           => "(concat 1 ?n (conv2d ?sx ?sy ?p ?c ?x ?y) (conv2d ?sx ?sy ?p ?c ?x ?z)) " ),
+        // DROPPED inverse: -concatenation-and-conv.-2 -- same unbound-?n issue as -matrix-mul.-1 above
+        //   (the ewadd-of-conv LHS carries no rank). FORWARD (conv-of-concat => ewadd) is kept.
+        rw!("-concatenation-and-pooling-0"     ;"(poolavg (concat 1 ?n ?x ?y) ?kx ?ky ?sx ?sy ?p ?c)"                               => "(concat 1 ?n (poolavg ?x ?kx ?ky ?sx ?sy ?p ?c) (poolavg ?y ?kx ?ky ?sx ?sy ?p ?c)) "       ),
+        rw!("-concatenation-and-pooling-1"     ;"(poolmax (concat 0 ?n ?x ?y) ?kx ?ky ?sx ?sy ?p ?c)"                               => "(concat 0 ?n (poolmax ?x ?kx ?ky ?sx ?sy ?p ?c) (poolmax ?y ?kx ?ky ?sx ?sy ?p ?c)) "       ),
+        rw!("-concatenation-and-pooling-2"     ;"(poolmax (concat 1 ?n ?x ?y) ?kx ?ky ?sx ?sy ?p ?c)"                               => "(concat 1 ?n (poolmax ?x ?kx ?ky ?sx ?sy ?p ?c) (poolmax ?y ?kx ?ky ?sx ?sy ?p ?c)) "       ),
         // --- min/max (ewmax/ewmin) lattice axioms + the PWL relu BRIDGE. Added so the
         //     GPU-free axiom verifier (`-m verify`) can verify the verifiability-relevant
         //     min/max rewrite family, which the original axiom set lacked (it had ewadd/

@@ -101,6 +101,33 @@ pub fn rules<A: Analysis<Mdl>>() -> Vec<Rewrite<Mdl, A>> { vec![
         rw!("-concatenation-and-pooling-0"     ;"(poolavg ?kx ?ky ?sx ?sy ?p (concat 1 ?x ?y))"                                     => "(concat 1 (poolavg ?kx ?ky ?sx ?sy ?p ?x) (poolavg ?kx ?ky ?sx ?sy ?p ?y)) "               ),
         rw!("-concatenation-and-pooling-1"     ;"(poolmax ?kx ?ky ?sx ?sy ?p (concat 0 ?x ?y))"                                     => "(concat 0 (poolmax ?kx ?ky ?sx ?sy ?p ?x) (poolmax ?kx ?ky ?sx ?sy ?p ?y)) "               ),
         rw!("-concatenation-and-pooling-2"     ;"(poolmax ?kx ?ky ?sx ?sy ?p (concat 1 ?x ?y))"                                     => "(concat 1 (poolmax ?kx ?ky ?sx ?sy ?p ?x) (poolmax ?kx ?ky ?sx ?sy ?p ?y)) "               ),
+        // --- min/max (ewmax/ewmin) lattice axioms + the PWL relu BRIDGE. Added so the
+        //     GPU-free axiom verifier (`-m verify`) can verify the verifiability-relevant
+        //     min/max rewrite family, which the original axiom set lacked (it had ewadd/
+        //     ewmul/matmul/conv/... but no ewmax/ewmin). All are true of elementwise
+        //     max/min over reals. assoc/comm/distributivity/bridge are bidirectional (both
+        //     forms may appear); idempotence/absorption are one-way SIMPLIFICATIONS (the
+        //     reverse would explode the egraph and isn't needed to discover an equality).
+        //     Bridge: max(x,y)=x+relu(y-x), min(x,y)=x-relu(x-y) -- this is what connects
+        //     the min/max forms to the relu topology CROWN verifies. ---
+        rw!("ewmax-is-associative"            ; "(ewmax ?x (ewmax ?y ?z))" => "(ewmax (ewmax ?x ?y) ?z)"),
+        rw!("-ewmax-is-associative"           ; "(ewmax (ewmax ?x ?y) ?z)" => "(ewmax ?x (ewmax ?y ?z))"),
+        rw!("ewmax-is-commutative"            ; "(ewmax ?x ?y)" => "(ewmax ?y ?x)"),
+        rw!("ewmin-is-associative"            ; "(ewmin ?x (ewmin ?y ?z))" => "(ewmin (ewmin ?x ?y) ?z)"),
+        rw!("-ewmin-is-associative"           ; "(ewmin (ewmin ?x ?y) ?z)" => "(ewmin ?x (ewmin ?y ?z))"),
+        rw!("ewmin-is-commutative"            ; "(ewmin ?x ?y)" => "(ewmin ?y ?x)"),
+        rw!("ewmax-is-idempotent"             ; "(ewmax ?x ?x)" => "?x"),
+        rw!("ewmin-is-idempotent"             ; "(ewmin ?x ?x)" => "?x"),
+        rw!("max-absorbs-min"                 ; "(ewmax ?x (ewmin ?x ?y))" => "?x"),
+        rw!("min-absorbs-max"                 ; "(ewmin ?x (ewmax ?x ?y))" => "?x"),
+        rw!("max-min-distributivity"          ; "(ewmax ?x (ewmin ?y ?z))" => "(ewmin (ewmax ?x ?y) (ewmax ?x ?z))"),
+        rw!("-max-min-distributivity"         ; "(ewmin (ewmax ?x ?y) (ewmax ?x ?z))" => "(ewmax ?x (ewmin ?y ?z))"),
+        rw!("min-max-distributivity"          ; "(ewmin ?x (ewmax ?y ?z))" => "(ewmax (ewmin ?x ?y) (ewmin ?x ?z))"),
+        rw!("-min-max-distributivity"         ; "(ewmax (ewmin ?x ?y) (ewmin ?x ?z))" => "(ewmin ?x (ewmax ?y ?z))"),
+        rw!("max-relu-bridge"                 ; "(ewmax ?x ?y)" => "(ewadd ?x (relu (ewsub ?y ?x)))"),
+        rw!("-max-relu-bridge"                ; "(ewadd ?x (relu (ewsub ?y ?x)))" => "(ewmax ?x ?y)"),
+        rw!("min-relu-bridge"                 ; "(ewmin ?x ?y)" => "(ewsub ?x (relu (ewsub ?x ?y)))"),
+        rw!("-min-relu-bridge"                ; "(ewsub ?x (relu (ewsub ?x ?y)))" => "(ewmin ?x ?y)"),
 ]}
 
 pub fn rules_from_str(rs: Vec<&str>, filter_after: bool) -> Vec<Rewrite<Mdl, TensorAnalysis>> {

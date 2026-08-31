@@ -328,6 +328,17 @@ fn main() {
                        the printed Stopped: reason for the budget verdict."),
         )
         .arg(
+            Arg::with_name("redundancy_iters")
+                .long("redundancy_iters")
+                .takes_value(true)
+                .default_value("4")
+                .help("For --mode redundancy: the reachability/budget knob. A rule is \
+                       pruned only if the OTHER rules re-derive its LHS=RHS within this \
+                       many e-graph iterations. Small => prune only short-derivation \
+                       redundancies (keeps shortcuts, preserves reachability); large => \
+                       prune aggressively (smaller set, worse budget-reachability)."),
+        )
+        .arg(
             Arg::with_name("weight_names_json")
                 .long("weight_names_json")
                 .takes_value(true)
@@ -357,6 +368,7 @@ fn main() {
         "verify" => prove_taso_rules(matches),
         "test" => test(matches),
         "convert" => convert_learned_rules(matches),
+        "redundancy" => prune_redundant(matches),
         _ => panic!("Running mode not supported"),
     }
 }
@@ -1320,5 +1332,174 @@ fn prove_taso_rules(matches: clap::ArgMatches) {
             }
             break;
         }
+    }
+}
+
+/// Ground one side of a rule (an egg PatternAst) into `expr`: each pattern Var
+/// becomes a fresh Input leaf of shape [d,d] (shared across sides via `varmap`),
+/// each ENode is copied with remapped children. Returns None (=> "keep this rule,
+/// don't try to prune it") if the side uses any non-elementwise op, since those
+/// need shape assignment we don't attempt here (elementwise ops always typecheck
+/// under a uniform square shape). The groundable set is exactly the PWL/AC family.
+fn ground_side(
+    ast: &egg::RecExpr<egg::ENodeOrVar<Mdl>>,
+    expr: &mut egg::RecExpr<Mdl>,
+    varmap: &mut HashMap<egg::Var, Id>,
+    d: i32,
+) -> Option<Id> {
+    let nodes = ast.as_ref();
+    let mut ids: Vec<Id> = vec![Id::from(0usize); nodes.len()];
+    for i in 0..nodes.len() {
+        ids[i] = match &nodes[i] {
+            egg::ENodeOrVar::Var(sym) => {
+                if let Some(id) = varmap.get(sym) {
+                    *id
+                } else {
+                    let nm = format!("rv{}@{}_{}", varmap.len(), d, d);
+                    let name_id = expr.add(Mdl::Var(egg::Symbol::from(nm)));
+                    let inp = expr.add(Mdl::Input([name_id]));
+                    varmap.insert(*sym, inp);
+                    inp
+                }
+            }
+            egg::ENodeOrVar::ENode(m) => {
+                let groundable = matches!(
+                    m,
+                    Mdl::Ewadd(_)
+                        | Mdl::Ewsub(_)
+                        | Mdl::Ewmax(_)
+                        | Mdl::Ewmin(_)
+                        | Mdl::Ewmul(_)
+                        | Mdl::Relu(_)
+                );
+                if !groundable {
+                    return None;
+                }
+                let mut node = m.clone();
+                node.update_children(|c| ids[usize::from(c)]);
+                expr.add(node)
+            }
+        };
+    }
+    Some(ids[nodes.len() - 1])
+}
+
+/// --mode redundancy: greedily prune rules whose LHS=RHS equality is re-derivable
+/// from the OTHER (kept) rules within `--redundancy_iters` e-graph iterations, in
+/// the SAME sound engine that will use them. Preserves the equational closure;
+/// only ever removes. Elementwise/PWL rules are checked; any rule with a
+/// non-elementwise op is conservatively kept. Writes kept rules to --out_file.
+fn prune_redundant(matches: clap::ArgMatches) {
+    let file = matches.value_of("rules").expect("Pls supply a rules file.");
+    let text = read_to_string(file).expect("reading rules file");
+    let budget: usize = matches
+        .value_of("redundancy_iters")
+        .unwrap()
+        .parse()
+        .expect("--redundancy_iters must be an integer");
+    let d: i32 = 4; // uniform square shape for grounded vars (elementwise-safe)
+
+    let rule_strs: Vec<String> = text
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect();
+    let n = rule_strs.len();
+
+    // Parse each "lhs=>rhs" into (lhs_ast, rhs_ast); None if it doesn't parse.
+    let parsed: Vec<Option<(egg::RecExpr<egg::ENodeOrVar<Mdl>>, egg::RecExpr<egg::ENodeOrVar<Mdl>>)>> =
+        rule_strs
+            .iter()
+            .map(|s| {
+                let mut it = s.splitn(2, "=>");
+                let l = it.next().unwrap().trim();
+                let r = it.next().map(|x| x.trim());
+                match (l.parse::<Pattern<Mdl>>(), r.map(|x| x.parse::<Pattern<Mdl>>())) {
+                    (Ok(lp), Some(Ok(rp))) => Some((lp.ast, rp.ast)),
+                    _ => None,
+                }
+            })
+            .collect();
+
+    // Order candidates largest-LHS-first: prefer removing complex rules, keeping
+    // simple generators (assoc/comm survive -- none derives another).
+    let mut order: Vec<usize> = (0..n).collect();
+    order.sort_by_key(|&i| {
+        std::cmp::Reverse(parsed[i].as_ref().map(|(l, _)| l.as_ref().len()).unwrap_or(0))
+    });
+
+    let mut kept = vec![true; n];
+    let mut n_groundable = 0usize;
+    let mut pruned = 0usize;
+
+    for &i in &order {
+        if !kept[i] {
+            continue;
+        }
+        let (la, ra) = match &parsed[i] {
+            Some(p) => p,
+            None => continue, // unparseable -> keep
+        };
+        // Ground both sides into one RecExpr, joined by a Noop so both are reachable.
+        let mut expr = egg::RecExpr::default();
+        let mut varmap: HashMap<egg::Var, Id> = HashMap::new();
+        let id_l = match ground_side(la, &mut expr, &mut varmap, d) {
+            Some(x) => x,
+            None => continue, // non-elementwise -> keep
+        };
+        let id_r = match ground_side(ra, &mut expr, &mut varmap, d) {
+            Some(x) => x,
+            None => continue,
+        };
+        let _root = expr.add(Mdl::Noop([id_l, id_r]));
+        n_groundable += 1;
+
+        // The other kept rules (no blacklist filtering: we want maximal
+        // derivability). Saturate the grounded terms under the iteration budget.
+        // (Recompiling the subset per check is cheap vs. the saturation itself.)
+        let subset_strs: Vec<&str> = (0..n)
+            .filter(|&j| kept[j] && j != i)
+            .map(|j| rule_strs[j].as_str())
+            .collect();
+        let subset = rules_from_str(subset_strs, /*filter_after=*/ false);
+        let runner = Runner::<Mdl, TensorAnalysis, ()>::default()
+            .with_iter_limit(budget)
+            .with_node_limit(20000)
+            .with_time_limit(std::time::Duration::from_secs(5))
+            .with_expr(&expr)
+            .run(&subset[..]);
+        let rt = runner.roots[0];
+        let (cl, cr) = runner.egraph[rt]
+            .nodes
+            .iter()
+            .find_map(|nd| {
+                if let Mdl::Noop([a, b]) = nd {
+                    Some((*a, *b))
+                } else {
+                    None
+                }
+            })
+            .expect("Noop root");
+        if runner.egraph.find(cl) == runner.egraph.find(cr) {
+            kept[i] = false;
+            pruned += 1;
+        }
+    }
+
+    println!(
+        "redundancy: {} rules, {} groundable (elementwise/PWL), budget {} iters",
+        n, n_groundable, budget
+    );
+    println!(
+        "redundancy: pruned {} redundant, kept {} ({} non-groundable kept as-is)",
+        pruned,
+        n - pruned,
+        n - n_groundable
+    );
+    if let Some(outf) = matches.value_of("out_file") {
+        let kept_rules: Vec<&str> = (0..n).filter(|&j| kept[j]).map(|j| rule_strs[j].as_str()).collect();
+        std::fs::write(outf, kept_rules.join("\n")).expect("writing out_file");
+        println!("redundancy: wrote {} kept rules to {}", kept_rules.len(), outf);
     }
 }

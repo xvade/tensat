@@ -1398,6 +1398,10 @@ fn prune_redundant(matches: clap::ArgMatches) {
         .parse()
         .expect("--redundancy_iters must be an integer");
     let d: i32 = 4; // uniform square shape for grounded vars (elementwise-safe)
+    // Per-check saturation caps (memory/time guards). Tunable via --n_nodes/--n_sec so a
+    // large rule set (which OOMs at a high node cap) can be pruned with a lower cap.
+    let check_nodes: usize = matches.value_of("n_nodes").unwrap().parse().unwrap_or(20000);
+    let check_secs: u64 = matches.value_of("n_sec").unwrap().parse().unwrap_or(5);
 
     let rule_strs: Vec<String> = text
         .lines()
@@ -1465,8 +1469,8 @@ fn prune_redundant(matches: clap::ArgMatches) {
         let subset = rules_from_str(subset_strs, /*filter_after=*/ false);
         let runner = Runner::<Mdl, TensorAnalysis, ()>::default()
             .with_iter_limit(budget)
-            .with_node_limit(20000)
-            .with_time_limit(std::time::Duration::from_secs(5))
+            .with_node_limit(check_nodes)
+            .with_time_limit(std::time::Duration::from_secs(check_secs))
             .with_expr(&expr)
             .run(&subset[..]);
         let rt = runner.roots[0];

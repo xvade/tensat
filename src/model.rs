@@ -75,6 +75,13 @@ pub enum DataKind {
     Scalar,
     Tnsr,
     TnsrTuple,
+    /// A constant-tensor op (Cpool/Iconv/Imatmul/Iewmul) that TASO models only
+    /// symbolically (MagicConst -- shape supplied by the consuming op), so it has
+    /// no standalone tensor. The const's identity is carried in `name` (e.g.
+    /// "Iewmul"). A Const enode is only ever a child of an APPROVED consumer whose
+    /// make()/apply resolves it; the applier declines to build any other parent
+    /// (see rewrites.rs). PROBLEMATIC.md #8 / docs/ADD_AN_OP.md.
+    Const,
 }
 
 impl Default for DataKind {
@@ -321,6 +328,16 @@ impl Analysis<Mdl> for TensorAnalysis {
             }
 
             Mdl::Ewmul([a, b]) => {
+                // Consumer resolution for the Iewmul (all-ones) constant: ewmul(x, ones)
+                // == x, so the enode's metadata IS the other operand's -- no tensor is
+                // materialized (the const carries no shape). Only ewmul is an approved
+                // Iewmul consumer; the applier declines any other parent of a Const.
+                if x(a).dtype == DataKind::Const {
+                    return x(b).clone();
+                }
+                if x(b).dtype == DataKind::Const {
+                    return x(a).clone();
+                }
                 // Check types
                 assert!(x(a).dtype == DataKind::Tnsr);
                 assert!(x(b).dtype == DataKind::Tnsr);
@@ -952,6 +969,19 @@ impl Analysis<Mdl> for TensorAnalysis {
                 meta: std::ptr::null_mut(),
                 meta_2: std::ptr::null_mut(),
                 all_weights: false,
+                weight_names: BTreeSet::new(),
+            },
+
+            // Constant-tensor ops: a symbolic marker (no standalone tensor -- see
+            // DataKind::Const). Only ever a child of an approved consumer whose make()
+            // resolves it. Iewmul (all-ones) is the identity for ewmul.
+            Mdl::Iewmul => Self::Data {
+                dtype: DataKind::Const,
+                val: 0,
+                name: "Iewmul".to_string(),
+                meta: std::ptr::null_mut(),
+                meta_2: std::ptr::null_mut(),
+                all_weights: true,          // compile-time constant
                 weight_names: BTreeSet::new(),
             },
 

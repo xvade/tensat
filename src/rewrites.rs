@@ -467,7 +467,15 @@ fn check_pat(
                 }
                 // root node not in egraph, compute metadata
                 let mut g = egraph.analysis.graph.borrow_mut();
-                let result = match e {
+                // Central const guard: a Const child (Cpool/Iconv/Imatmul/Iewmul) may
+                // only be built under an APPROVED consumer whose arm resolves it. Decline
+                // any other parent so a bare-variable rule can't construct an
+                // unresolvable const-child op and panic make(). See PROBLEMATIC.md #8.
+                let has_const_child = results.iter().any(|r| r.2.dtype == DataKind::Const);
+                let result = if has_const_child && !matches!(e, Mdl::Ewmul(_)) {
+                    let default_data: TData = Default::default();
+                    (false, None, default_data)
+                } else { match e {
                     Mdl::Num(_n) => {
                         let t_data = TData {
                             dtype: DataKind::Scalar,
@@ -656,6 +664,16 @@ fn check_pat(
                         // Check types
                         let _a_data = &results[0].2;
                         let _b_data = &results[1].2;
+                        // Iewmul (all-ones) consumer resolution: ewmul(x, ones) == x, so
+                        // the enode's tensor IS the other operand's (no materialization).
+                        // TData is not Clone, so rebuild it from the surviving operand.
+                        if _a_data.dtype == DataKind::Const {
+                            (true, None, TData { dtype: _b_data.dtype, val: _b_data.val,
+                                                 tnsr: _b_data.tnsr.clone(), tnsr_2: _b_data.tnsr_2.clone() })
+                        } else if _b_data.dtype == DataKind::Const {
+                            (true, None, TData { dtype: _a_data.dtype, val: _a_data.val,
+                                                 tnsr: _a_data.tnsr.clone(), tnsr_2: _a_data.tnsr_2.clone() })
+                        } else {
                         assert!(_a_data.dtype == DataKind::Tnsr);
                         assert!(_b_data.dtype == DataKind::Tnsr);
 
@@ -679,6 +697,7 @@ fn check_pat(
                                 };
                                 (true, None, t_data)
                             }
+                        }
                         }
                     }
 
@@ -892,11 +911,16 @@ fn check_pat(
                         }
                     }
 
+                    // const-tensor marker (all-ones); resolved by its ewmul consumer
+                    Mdl::Iewmul => {
+                        (true, None, TData { dtype: DataKind::Const, val: 0, tnsr: None, tnsr_2: None })
+                    }
+
                     other => {
                         println!("{:?}", other);
                         todo!()
                     }
-                };
+                } };
                 if get_exist_nodes && result.0 {
                     let mut existing_nodes = HashSet::<Mdl>::new();
                     for res in results.iter() {

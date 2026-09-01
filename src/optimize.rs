@@ -547,6 +547,7 @@ impl CostModel {
             | Mdl::Reshape(_)
             | Mdl::Transpose(_)
             | Mdl::Dropout(_)
+            | Mdl::Iewmul            // const-tensor marker: compile-time, zero cost
             | Mdl::Noop(_) => 0.0,
 
             Mdl::Relu(_a) => {
@@ -700,6 +701,12 @@ impl CostModel {
             }
 
             Mdl::Ewmul([_a, _b]) => {
+                // ewmul(x, Iewmul-const) is a no-op wrapper (resolves to x). Charge a
+                // small positive self-cost -- no taso op, its Const child has no tensor --
+                // so extraction strictly prefers the bare x over this wrapper.
+                if x(_a).dtype == DataKind::Const || x(_b).dtype == DataKind::Const {
+                    1.0
+                } else {
                 // Check types
                 let _a_data = x(_a);
                 let _b_data = x(_b);
@@ -720,6 +727,7 @@ impl CostModel {
                     self.all_weight_discount * runtime
                 } else {
                     runtime
+                }
                 }
             }
 

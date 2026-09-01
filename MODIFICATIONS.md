@@ -47,6 +47,22 @@ builders, `parse_model` ingestion, and `CheckApply`; plus parser guards for
 empty-param and newline edge cases. This is the end-to-end min/max support the
 maxout/lattice experiments depend on.
 
+## Constant-tensor application (`DataKind::Const`, 2026-09-01)
+
+TASO models the const ops (`Cpool`/`Iconv`/`Imatmul`/`Iewmul`) only symbolically
+(`MagicConst` — shape supplied by the consumer), so tensat left them `todo!()` in
+both `make()` (model.rs) and the applier (rewrites.rs) — any rule using one
+**panicked on application**. Added a `DataKind::Const` marker + **consumer
+resolution**: `make`/`apply` of a const emit a Const-marked `Data` (identity in
+`name`); the approved consumer detects a Const child and returns the *other*
+operand's data (no tensor materialized). A **central applier guard** declines to
+build any non-approved parent of a Const child. `get_self_cost` charges the
+wrapper a small positive cost so extraction prefers the bare operand (the const
+then never reaches extraction/reconstruct). **Implemented for `Iewmul`**
+(consumer `ewmul`, `ewmul(x, ones)==x`); `Imatmul`/`Iconv` are mechanical
+follow-ups of the same pattern, `Cpool` needs real materialization. See
+`../PROBLEMATIC.md` #8 and `../docs/ADD_AN_OP.md`.
+
 ## Build (`build.rs`, `Cargo.toml`, `wrapper.h`)
 
 TASO/protobuf link paths are now env-overridable (`TASO_LIB_DIR`,

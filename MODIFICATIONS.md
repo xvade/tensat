@@ -61,7 +61,7 @@ added; bindgen bumped.
   canaries and the min/max axioms (test 4), and `redundancy` grounding + pruning
   (test 8). These run against the **prebuilt** `target/debug/tensat` binary and
   need no rebuild.
-- **Rust unit tests:** `tests/parse.rs` (`parse_model`). ⚠ Building these
-  requires network access to resolve the crates.io registry, which the offline
-  research sandbox lacks — see `../PROBLEMATIC.md`. They are expected to build
-  and pass in the original (networked) container build environment.
+- **Rust unit tests:** `tests/parse.rs` (`parse_model`) — **passing** via a
+  one-time networked `cargo fetch` on the host, then `cargo test --offline` in
+  the container (`test model_parser ... ok`). Recipe + gotchas (egg symlink,
+  `LIBCLANG_PATH`) in `../PROBLEMATIC.md` #3.

@@ -571,9 +571,15 @@ fn check_pat(
                         // any other params on a const weight (the identity holds only there,
                         // so make() never sees a non-identity const-conv).
                         if _wght_data.dtype == DataKind::Const {
-                            // Iconv is val 3; resolve only for it AND the identity config.
-                            if _wght_data.val == 3 && _stride_h_data.val == 1 && _stride_w_data.val == 1
-                                && _pad_data.val == 0 && _act_data.val == 0
+                            let wv = _wght_data.val;
+                            let same_1x1 = _stride_h_data.val == 1 && _stride_w_data.val == 1
+                                && _pad_data.val == 0;
+                            // Iconv (val 3): conv2d(1,1,SAME,NONE, x, I) == x.
+                            // Cpool (val >= 1e6): conv2d(1,1,SAME,acti, x, Cpool) == [relu?]
+                            //   poolavg(x); stride-1 SAME -> output shape == x. Both return x's
+                            //   metadata; a non-identity/non-Cpool const config declines.
+                            if (wv == 3 && same_1x1 && _act_data.val == 0)
+                                || (wv >= 1_000_000 && same_1x1)
                             {
                                 (true, None, TData { dtype: _inpt_data.dtype, val: _inpt_data.val,
                                                      tnsr: _inpt_data.tnsr.clone(), tnsr_2: _inpt_data.tnsr_2.clone() })
@@ -951,6 +957,12 @@ fn check_pat(
                     Mdl::Iewmul | Mdl::Imatmul | Mdl::Iconv(_) => {
                         let code = match e { Mdl::Iewmul => 1, Mdl::Imatmul => 2, _ => 3 };
                         (true, None, TData { dtype: DataKind::Const, val: code, tnsr: None, tnsr_2: None })
+                    }
+                    // Cpool packs (kh,kw) into val (1_000_000 + kh*1000 + kw) for its conv2d consumer.
+                    Mdl::Cpool([_kh, _kw]) => {
+                        let kh = results[0].2.val;
+                        let kw = results[1].2.val;
+                        (true, None, TData { dtype: DataKind::Const, val: 1_000_000 + kh * 1000 + kw, tnsr: None, tnsr_2: None })
                     }
 
                     other => {

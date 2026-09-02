@@ -60,10 +60,13 @@ declines any non-approved parent of a Const child, and each consumer arm resolve
 only *its* const (by the `val` tag) and declines a mismatched one or non-identity
 conv config. `get_self_cost` charges the wrapper a small positive cost so
 extraction prefers the bare operand (the const then never reaches
-extraction/reconstruct). **Implemented for the identity consts `Iewmul`
-(ewmul), `Imatmul` (matmul), `Iconv` (conv2d(1,1,SAME,NONE))** — all `== x`.
-`Cpool` (`== poolavg`, not `== x`) still needs real materialization. See
-`../PROBLEMATIC.md` #8 and `../docs/ADD_AN_OP.md`.
+extraction/reconstruct). **Implemented for all four consts:** the identity ones
+`Iewmul` (ewmul), `Imatmul` (matmul), `Iconv` (conv2d(1,1,SAME,NONE)) each `== x`;
+and `Cpool` via `conv2d` — `conv2d(x, Cpool) == poolavg(x)`, and since every Cpool
+rule is stride-1 SAME-pad the output shape equals `x`'s, so the consumer returns
+`x`'s shape-metadata (the marker packs `kh,kw` in `val`) and a **large** cost
+forces extraction to the equivalent `poolavg` (reconstruct never sees a Cpool).
+See `../PROBLEMATIC.md` #8 and `../docs/ADD_AN_OP.md`.
 
 ## Build (`build.rs`, `Cargo.toml`, `wrapper.h`)
 

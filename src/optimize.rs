@@ -550,6 +550,7 @@ impl CostModel {
             | Mdl::Iewmul            // const-tensor markers: compile-time, zero cost
             | Mdl::Imatmul
             | Mdl::Iconv(_)
+            | Mdl::Cpool(_)
             | Mdl::Noop(_) => 0.0,
 
             Mdl::Relu(_a) => {
@@ -616,10 +617,12 @@ impl CostModel {
             }
 
             Mdl::Conv2d([_stride_h, _stride_w, _pad, _act, _inpt, _wght]) => {
-                // conv2d(1,1,SAME,NONE, x, Iconv-const) resolves to x; nominal positive
-                // cost (no taso op) so extraction prefers the bare x.
+                // conv2d with a const weight: Iconv (val 3) resolves to x -> nominal 1.0 so
+                // the bare x wins. Cpool (val >= 1e6) resolves to poolavg -> a LARGE cost so
+                // extraction picks the equivalent poolavg enode instead of this conv wrapper
+                // (reconstruct can't materialize a Cpool).
                 if x(_wght).dtype == DataKind::Const {
-                    return 1.0;
+                    return if x(_wght).val >= 1_000_000 { 1.0e6 } else { 1.0 };
                 }
                 // Check types
                 let _stride_h_data = x(_stride_h);

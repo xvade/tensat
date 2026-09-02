@@ -280,9 +280,13 @@ impl Analysis<Mdl> for TensorAnalysis {
                 }
             },
             Mdl::Conv2d([stride_h, stride_w, pad, act, inpt, wght]) => {
-                // Iconv (identity conv kernel) consumer resolution: conv2d(1,1,SAME,NONE,
-                // x, I) == x. Only that configuration is the identity; the applier declines
-                // any other params on a const weight, so make() only sees the identity case.
+                // Const-weight consumer resolution (the applier gates which reach here):
+                //   Iconv: conv2d(1,1,SAME,NONE, x, I) == x.
+                //   Cpool: conv2d(1,1,SAME,acti, x, Cpool) == [relu?] poolavg(x); every
+                //     Cpool rule is stride-1 SAME-pad, so the output SHAPE equals x's --
+                //     return x's metadata. (The value is poolavg, tracked only by shape
+                //     here; a high extraction cost, below, keeps the equivalent poolavg as
+                //     the extracted form so `reconstruct` never sees a Cpool.)
                 if x(wght).dtype == DataKind::Const {
                     return x(inpt).clone();
                 }
@@ -993,7 +997,11 @@ impl Analysis<Mdl> for TensorAnalysis {
             // ewmul), Imatmul (identity matrix, matmul), Iconv (identity kernel, conv2d).
             Mdl::Iewmul | Mdl::Imatmul | Mdl::Iconv(_) => Self::Data {
                 dtype: DataKind::Const,
-                val: 0,
+                val: match enode {          // val tags the const type (checked by consumers)
+                    Mdl::Iewmul => 1,
+                    Mdl::Imatmul => 2,
+                    _ => 3,                 // Iconv
+                },
                 name: match enode {
                     Mdl::Iewmul => "Iewmul",
                     Mdl::Imatmul => "Imatmul",
@@ -1002,6 +1010,18 @@ impl Analysis<Mdl> for TensorAnalysis {
                 meta: std::ptr::null_mut(),
                 meta_2: std::ptr::null_mut(),
                 all_weights: true,          // compile-time constant
+                weight_names: BTreeSet::new(),
+            },
+
+            // Cpool (avg-pool kernel) carries (kh,kw); pack them into `val` as
+            // 1_000_000 + kh*1000 + kw so the conv2d consumer can build the poolavg.
+            Mdl::Cpool([kh, kw]) => Self::Data {
+                dtype: DataKind::Const,
+                val: 1_000_000 + x(kh).val * 1000 + x(kw).val,
+                name: "Cpool".to_string(),
+                meta: std::ptr::null_mut(),
+                meta_2: std::ptr::null_mut(),
+                all_weights: true,
                 weight_names: BTreeSet::new(),
             },
 

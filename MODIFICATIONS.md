@@ -125,14 +125,29 @@ TASO/protobuf link paths are now env-overridable (`TASO_LIB_DIR`,
 checkout) instead of hardcoded to one Docker layout. `--no_runtime_report`
 added; bindgen bumped.
 
-## Tests
+## Doc / spec / test map (whole fork)
 
-- **CLI integration (runnable, green):** `../NNs/tests/run_tests.sh` exercises
-  `parse_check` (test 2), `verify` soundness + liveness against negative
-  canaries and the min/max axioms (test 4), and `redundancy` grounding + pruning
-  (test 8). These run against the **prebuilt** `target/debug/tensat` binary and
-  need no rebuild.
-- **Rust unit tests:** `tests/parse.rs` (`parse_model`) — **passing** via a
-  one-time networked `cargo fetch` on the host, then `cargo test --offline` in
-  the container (`test model_parser ... ok`). Recipe + gotchas (egg symlink,
-  `LIBCLANG_PATH`) in `../PROBLEMATIC.md` #3.
+The `tensat/` fork is our code end to end (not just the deltas above). Where each
+subsystem is specified and tested — the parallel to `../TASO_SUMMARY.md` §8:
+
+| Subsystem (`src/`) | Doc / spec | Test |
+|---|---|---|
+| egg language + parser (`model.rs` `define_language!`, `parse.rs`, `equation.pest`) | `../TENSAT_SUMMARY.md` §3.2; "Language / parser" above | `tests/parse.rs` (rust unit); `run_tests.sh` **Test 2** (`-m parse_check`, the authoritative current-arity oracle) |
+| `TensorAnalysis::make/merge` (shape metadata, weight provenance, const markers) | `///` doc-comments in `model.rs`; §"Weight provenance" + "Constant-tensor application" above; TASO shapes in `../taso/src/core/README.md` | end-to-end: `run_tests.sh` ingests `graph_subst.pb` and any wrong shape trips a `make()` assert; provenance via reconstruct |
+| Apply / `CheckApply` (`rewrites.rs`) | `///` doc-comments; `../PROBLEMATIC.md` #8 (the apply-safe op set) | `run_tests.sh` **Test 12** (apply-smoke: each applicable op fires without `todo!()`; gated ops must panic) |
+| Axiom verifier `-m verify` (`prove_taso_rules`) | table above; `../BUGS.md` (the `rules()` bit-rot fix) | `run_tests.sh` **Test 4** (soundness canaries + min/max axioms); `test_z3_axioms.sh` (Z3 lane) |
+| Redundancy pruner `-m redundancy` | table above | `run_tests.sh` **Test 8** (grounds PWL rules, prunes a derivable copy) |
+| Extraction — **VerifCost** (`optimize.rs`) | extraction table above; `../PROBLEMATIC.md` #2 | **gap:** no direct unit test of the IBP interval propagation (`enode_interval`/`relu_gap`); exercised only via the maxout/tll pipeline runs (env-blocked in-repo). The soundness property (unknown op → `None` → worst → repelled) is by construction. |
+| Extraction — runtime `CostModel` (greedy/ILP) | the "Runtime cost is off" note above | `run_tests.sh` **Test 13** (`Best cost: 0.0`; greedy still extracts) — verifies it's off, not its optimality (intentionally degenerate) |
+| Weight provenance (`weight_names` sidecar) | §"Weight provenance" above | reconstruct resolves real weights from the sidecar; `../NNs/tests/test_reconstruct_arms.py` for the reconstruct side |
+| Arch builders (`bert/inceptionv3/vgg/…rs`) | `../TENSAT_SUMMARY.md` §7 | **upstream, unused by us** — reachable via `--model <name>`; our path is `--model_file <.taso>`. Documented by role, not tested. |
+
+**Test-infra recipe.** CLI tests run against the **prebuilt** `target/debug/tensat`
+(no rebuild). Rust unit tests (`tests/parse.rs`) need a one-time networked `cargo fetch`
+on the host, then `cargo test --offline` in the container — recipe + gotchas (egg
+symlink, `LIBCLANG_PATH`, the offline-build workaround) in `../PROBLEMATIC.md` #3.
+
+**Known test gaps** (→ `../PROBLEMATIC.md`): no rust unit tests for the FFI-heavy
+`make`/`apply`/`VerifCost` paths (they need the linked TASO runtime, so they're covered
+end-to-end by the CLI tests instead); the reconstruct/verify round-trips are deferred to
+the GPU env (`#5`).

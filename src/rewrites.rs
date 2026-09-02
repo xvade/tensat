@@ -951,6 +951,28 @@ fn check_pat(
                         }
                     }
 
+                    Mdl::Transpose([_inpt, _perm, _shuffle]) => {
+                        let inpt_data = &results[0].2;
+                        assert!(inpt_data.dtype == DataKind::Tnsr);
+                        let t_inpt = inpt_data.tnsr.unwrap();
+                        // perm string is on the perm_name Var child; results[1].1 is its
+                        // egraph Id. shuffle forced true (value-invariant; taso asserts it).
+                        let perm_id = results[1].1.unwrap();
+                        let perms: Vec<i32> = egraph[perm_id].data.name
+                            .split("_").map(|s| s.parse::<i32>().unwrap()).collect();
+                        unsafe {
+                            let cpp_perms = convert_to_cpp_vec(&perms);
+                            let ptr = cpp_perms.as_ptr() as *const [u64; 3];
+                            let op = (*g.model).get_or_create_transpose(t_inpt, ptr, true);
+                            if op == Op_INVALID_OP {
+                                (false, None, TData::default())
+                            } else {
+                                let t = (*op.ptr).outputs[0].clone();
+                                (true, None, TData { dtype: DataKind::Tnsr, val: 0, tnsr: Some(t), tnsr_2: None })
+                            }
+                        }
+                    }
+
                     // const-tensor markers (identity ops); resolved by their consumer.
                     // `val` tags which const (1 Iewmul, 2 Imatmul, 3 Iconv) so the consumer
                     // arm resolves only ITS const and declines a mismatched one.

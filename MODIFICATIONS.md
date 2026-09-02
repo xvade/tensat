@@ -68,6 +68,19 @@ rule is stride-1 SAME-pad the output shape equals `x`'s, so the consumer returns
 forces extraction to the equivalent `poolavg` (reconstruct never sees a Cpool).
 See `../PROBLEMATIC.md` #8 and `../docs/ADD_AN_OP.md`.
 
+## Transpose application (`rewrites.rs` apply arm, 2026-09-01)
+
+`Mdl::Transpose` had a `make()` arm but no applier arm, so transpose rules
+panicked on application. Added the apply arm: the perm string is read from the
+`perm_name` `Var` child via the egraph (`results[i].1` is its egraph Id — the
+apply-side `TData` has no `name`), the perm is decoded to a C++ vector
+(`convert_to_cpp_vec`, now `pub`), and `get_or_create_transpose` is called with
+**shuffle forced `true`** — shuffle is value-invariant (transpose.cc changes only
+strides) and taso's `Transpose` ctor asserts it; `make()` was likewise changed to
+force `true` (a rule-emitted `shuffle 0` would otherwise trip the assert). Un-gates
+the 9,093 transpose rules. `poolmax`/`poolavg`/`smul` remain (need apply arms;
+pool's `get_or_create_pool2d` needs a kernel weight tensor).
+
 ## Build (`build.rs`, `Cargo.toml`, `wrapper.h`)
 
 TASO/protobuf link paths are now env-overridable (`TASO_LIB_DIR`,

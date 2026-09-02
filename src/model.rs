@@ -931,8 +931,12 @@ impl Analysis<Mdl> for TensorAnalysis {
                     .map(|x| x.parse::<i32>().unwrap())
                     .collect();
                 let t_inpt = x(inpt).meta;
-                let shuffle_val = x(shuffle).val;
-                let shuffle_bool = (shuffle_val == SHUFFLE);
+                let _shuffle_val = x(shuffle).val;
+                // shuffle is VALUE-invariant (transpose.cc: it changes only output strides),
+                // and taso's Transpose ctor asserts shuffle==true -- so always build with
+                // shuffle=true regardless of the egg flag. (Rule-emitted transposes carry
+                // shuffle 0, which would otherwise trip the assert.) See PROBLEMATIC.md #6/#8.
+                let shuffle_bool = true;
                 let all_weights = x(inpt).all_weights;
                 let weight_names = x(inpt).weight_names.clone();
 
@@ -1040,7 +1044,7 @@ impl Analysis<Mdl> for TensorAnalysis {
 ///
 /// The returned C++ format for vector is:
 /// [pointer_to_first_element, pointer_to_last_element, pointer_to_the_end_of_vector_capacity]
-unsafe fn convert_to_cpp_vec(v: &Vec<i32>) -> [*const i32; 3] {
+pub unsafe fn convert_to_cpp_vec(v: &Vec<i32>) -> [*const i32; 3] {
     [
         v.as_ptr(),
         v.as_ptr().offset(v.len().try_into().unwrap()),

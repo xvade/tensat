@@ -547,7 +547,9 @@ impl CostModel {
             | Mdl::Reshape(_)
             | Mdl::Transpose(_)
             | Mdl::Dropout(_)
-            | Mdl::Iewmul            // const-tensor marker: compile-time, zero cost
+            | Mdl::Iewmul            // const-tensor markers: compile-time, zero cost
+            | Mdl::Imatmul
+            | Mdl::Iconv(_)
             | Mdl::Noop(_) => 0.0,
 
             Mdl::Relu(_a) => {
@@ -614,6 +616,11 @@ impl CostModel {
             }
 
             Mdl::Conv2d([_stride_h, _stride_w, _pad, _act, _inpt, _wght]) => {
+                // conv2d(1,1,SAME,NONE, x, Iconv-const) resolves to x; nominal positive
+                // cost (no taso op) so extraction prefers the bare x.
+                if x(_wght).dtype == DataKind::Const {
+                    return 1.0;
+                }
                 // Check types
                 let _stride_h_data = x(_stride_h);
                 let _stride_w_data = x(_stride_w);
@@ -732,6 +739,11 @@ impl CostModel {
             }
 
             Mdl::Matmul([_act, _a, _b]) => {
+                // matmul(x, Imatmul-const) resolves to x; nominal positive cost (no taso
+                // op, its Const child has no tensor) so extraction prefers the bare x.
+                if x(_a).dtype == DataKind::Const || x(_b).dtype == DataKind::Const {
+                    return 1.0;
+                }
                 // Check types
                 let _act_data = x(_act);
                 let _a_data = x(_a);

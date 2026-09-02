@@ -211,6 +211,15 @@ impl Analysis<Mdl> for TensorAnalysis {
         let mut g = egraph.analysis.graph.borrow_mut();
         match enode {
             Mdl::Matmul([act, a, b]) => {
+                // Imatmul (identity matrix) consumer resolution: matmul(x, I) == x (and
+                // matmul(I, x) == x). The surviving operand is a matmul input, hence 2-D,
+                // so returning its metadata directly is sound; no tensor is materialized.
+                if x(a).dtype == DataKind::Const {
+                    return x(b).clone();
+                }
+                if x(b).dtype == DataKind::Const {
+                    return x(a).clone();
+                }
                 // Check types
                 assert!(x(act).dtype == DataKind::Scalar);
                 assert!(x(a).dtype == DataKind::Tnsr);
@@ -271,6 +280,12 @@ impl Analysis<Mdl> for TensorAnalysis {
                 }
             },
             Mdl::Conv2d([stride_h, stride_w, pad, act, inpt, wght]) => {
+                // Iconv (identity conv kernel) consumer resolution: conv2d(1,1,SAME,NONE,
+                // x, I) == x. Only that configuration is the identity; the applier declines
+                // any other params on a const weight, so make() only sees the identity case.
+                if x(wght).dtype == DataKind::Const {
+                    return x(inpt).clone();
+                }
                 // Check types
                 assert!(x(stride_h).dtype == DataKind::Scalar);
                 assert!(x(stride_w).dtype == DataKind::Scalar);
@@ -974,11 +989,16 @@ impl Analysis<Mdl> for TensorAnalysis {
 
             // Constant-tensor ops: a symbolic marker (no standalone tensor -- see
             // DataKind::Const). Only ever a child of an approved consumer whose make()
-            // resolves it. Iewmul (all-ones) is the identity for ewmul.
-            Mdl::Iewmul => Self::Data {
+            // resolves it (identity ops that reduce to the other operand): Iewmul (all-ones,
+            // ewmul), Imatmul (identity matrix, matmul), Iconv (identity kernel, conv2d).
+            Mdl::Iewmul | Mdl::Imatmul | Mdl::Iconv(_) => Self::Data {
                 dtype: DataKind::Const,
                 val: 0,
-                name: "Iewmul".to_string(),
+                name: match enode {
+                    Mdl::Iewmul => "Iewmul",
+                    Mdl::Imatmul => "Imatmul",
+                    _ => "Iconv",
+                }.to_string(),
                 meta: std::ptr::null_mut(),
                 meta_2: std::ptr::null_mut(),
                 all_weights: true,          // compile-time constant

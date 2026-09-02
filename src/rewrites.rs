@@ -472,7 +472,9 @@ fn check_pat(
                 // any other parent so a bare-variable rule can't construct an
                 // unresolvable const-child op and panic make(). See PROBLEMATIC.md #8.
                 let has_const_child = results.iter().any(|r| r.2.dtype == DataKind::Const);
-                let result = if has_const_child && !matches!(e, Mdl::Ewmul(_)) {
+                let result = if has_const_child
+                    && !matches!(e, Mdl::Ewmul(_) | Mdl::Matmul(_) | Mdl::Conv2d(_))
+                {
                     let default_data: TData = Default::default();
                     (false, None, default_data)
                 } else { match e {
@@ -564,6 +566,22 @@ fn check_pat(
                         let _act_data = &results[3].2;
                         let _inpt_data = &results[4].2;
                         let _wght_data = &results[5].2;
+                        // Iconv (identity conv kernel) consumer resolution: conv2d(1,1,
+                        // SAME,NONE, x, I) == x. Return x for exactly that config; DECLINE
+                        // any other params on a const weight (the identity holds only there,
+                        // so make() never sees a non-identity const-conv).
+                        if _wght_data.dtype == DataKind::Const {
+                            // Iconv is val 3; resolve only for it AND the identity config.
+                            if _wght_data.val == 3 && _stride_h_data.val == 1 && _stride_w_data.val == 1
+                                && _pad_data.val == 0 && _act_data.val == 0
+                            {
+                                (true, None, TData { dtype: _inpt_data.dtype, val: _inpt_data.val,
+                                                     tnsr: _inpt_data.tnsr.clone(), tnsr_2: _inpt_data.tnsr_2.clone() })
+                            } else {
+                                let default_data: TData = Default::default();
+                                (false, None, default_data)
+                            }
+                        } else {
                         assert!(_stride_h_data.dtype == DataKind::Scalar);
                         assert!(_stride_w_data.dtype == DataKind::Scalar);
                         assert!(_pad_data.dtype == DataKind::Scalar);
@@ -597,6 +615,7 @@ fn check_pat(
                                 };
                                 (true, None, t_data)
                             }
+                        }
                         }
                     }
 
@@ -664,15 +683,18 @@ fn check_pat(
                         // Check types
                         let _a_data = &results[0].2;
                         let _b_data = &results[1].2;
-                        // Iewmul (all-ones) consumer resolution: ewmul(x, ones) == x, so
-                        // the enode's tensor IS the other operand's (no materialization).
-                        // TData is not Clone, so rebuild it from the surviving operand.
-                        if _a_data.dtype == DataKind::Const {
+                        // Iewmul (all-ones, val 1) consumer resolution: ewmul(x, ones) == x,
+                        // so the enode's tensor IS the other operand's (no materialization).
+                        // TData is not Clone, so rebuild it. A Const child that is NOT Iewmul
+                        // is not the ewmul identity -> decline (soundness).
+                        if _a_data.dtype == DataKind::Const && _a_data.val == 1 {
                             (true, None, TData { dtype: _b_data.dtype, val: _b_data.val,
                                                  tnsr: _b_data.tnsr.clone(), tnsr_2: _b_data.tnsr_2.clone() })
-                        } else if _b_data.dtype == DataKind::Const {
+                        } else if _b_data.dtype == DataKind::Const && _b_data.val == 1 {
                             (true, None, TData { dtype: _a_data.dtype, val: _a_data.val,
                                                  tnsr: _a_data.tnsr.clone(), tnsr_2: _a_data.tnsr_2.clone() })
+                        } else if _a_data.dtype == DataKind::Const || _b_data.dtype == DataKind::Const {
+                            (false, None, TData::default())
                         } else {
                         assert!(_a_data.dtype == DataKind::Tnsr);
                         assert!(_b_data.dtype == DataKind::Tnsr);
@@ -706,6 +728,17 @@ fn check_pat(
                         let _act_data = &results[0].2;
                         let _a_data = &results[1].2;
                         let _b_data = &results[2].2;
+                        // Imatmul (identity matrix, val 2) consumer resolution: matmul(x, I)
+                        // == x. A non-Imatmul Const child -> decline (soundness).
+                        if _a_data.dtype == DataKind::Const && _a_data.val == 2 {
+                            (true, None, TData { dtype: _b_data.dtype, val: _b_data.val,
+                                                 tnsr: _b_data.tnsr.clone(), tnsr_2: _b_data.tnsr_2.clone() })
+                        } else if _b_data.dtype == DataKind::Const && _b_data.val == 2 {
+                            (true, None, TData { dtype: _a_data.dtype, val: _a_data.val,
+                                                 tnsr: _a_data.tnsr.clone(), tnsr_2: _a_data.tnsr_2.clone() })
+                        } else if _a_data.dtype == DataKind::Const || _b_data.dtype == DataKind::Const {
+                            (false, None, TData::default())
+                        } else {
                         assert!(_act_data.dtype == DataKind::Scalar);
                         assert!(_a_data.dtype == DataKind::Tnsr);
                         assert!(_b_data.dtype == DataKind::Tnsr);
@@ -731,6 +764,7 @@ fn check_pat(
                                 };
                                 (true, None, t_data)
                             }
+                        }
                         }
                     }
 
@@ -911,9 +945,12 @@ fn check_pat(
                         }
                     }
 
-                    // const-tensor marker (all-ones); resolved by its ewmul consumer
-                    Mdl::Iewmul => {
-                        (true, None, TData { dtype: DataKind::Const, val: 0, tnsr: None, tnsr_2: None })
+                    // const-tensor markers (identity ops); resolved by their consumer.
+                    // `val` tags which const (1 Iewmul, 2 Imatmul, 3 Iconv) so the consumer
+                    // arm resolves only ITS const and declines a mismatched one.
+                    Mdl::Iewmul | Mdl::Imatmul | Mdl::Iconv(_) => {
+                        let code = match e { Mdl::Iewmul => 1, Mdl::Imatmul => 2, _ => 3 };
+                        (true, None, TData { dtype: DataKind::Const, val: code, tnsr: None, tnsr_2: None })
                     }
 
                     other => {

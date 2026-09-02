@@ -995,6 +995,30 @@ impl Analysis<Mdl> for TensorAnalysis {
                 weight_names: BTreeSet::new(),
             },
 
+            // smul(tensor, scalar): build the REAL taso Mul (OP_MUL) so the extracted
+            // model exports a genuine scalar multiply (save_model serializes the taso
+            // graph, not the egg expr -- a make() that built nothing would silently drop
+            // the multiply on export). taso's Mul asserts the 2nd operand is 0-D; the
+            // applier gates on that before any Smul enode is added.
+            Mdl::Smul([a, b]) => {
+                assert!(x(a).dtype == DataKind::Tnsr);
+                assert!(x(b).dtype == DataKind::Tnsr);
+                let t_a = x(a).meta;
+                let t_b = x(b).meta;
+                let all_weights = x(a).all_weights && x(b).all_weights;
+                let weight_names: BTreeSet<String> = x(a).weight_names.union(&x(b).weight_names).cloned().collect();
+                let res = unsafe { g.mul(t_a, t_b) };
+                Self::Data {
+                    dtype: DataKind::Tnsr,
+                    val: 0,
+                    name: String::new(),
+                    meta: res,
+                    meta_2: std::ptr::null_mut(),
+                    all_weights: all_weights,
+                    weight_names: weight_names,
+                }
+            }
+
             // Constant-tensor ops: a symbolic marker (no standalone tensor -- see
             // DataKind::Const). Only ever a child of an approved consumer whose make()
             // resolves it (identity ops that reduce to the other operand): Iewmul (all-ones,

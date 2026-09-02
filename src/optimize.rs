@@ -551,6 +551,7 @@ impl CostModel {
             | Mdl::Imatmul
             | Mdl::Iconv(_)
             | Mdl::Cpool(_)
+            | Mdl::Smul(_)          // scalar mul: cheap-op class (make() builds the real Mul, so export is faithful)
             | Mdl::Noop(_) => 0.0,
 
             Mdl::Relu(_a) => {

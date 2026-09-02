@@ -78,8 +78,38 @@ apply-side `TData` has no `name`), the perm is decoded to a C++ vector
 **shuffle forced `true`** — shuffle is value-invariant (transpose.cc changes only
 strides) and taso's `Transpose` ctor asserts it; `make()` was likewise changed to
 force `true` (a rule-emitted `shuffle 0` would otherwise trip the assert). Un-gates
-the 9,093 transpose rules. `poolmax`/`poolavg`/`smul` remain (need apply arms;
-pool's `get_or_create_pool2d` needs a kernel weight tensor).
+the 9,093 transpose rules.
+
+## smul + pool application (`model.rs` make, `rewrites.rs` apply, 2026-09-01)
+
+`smul`, `poolmax`, `poolavg` all `todo!()`ed on application (smul had no `make()`
+arm either), so their rules panicked.
+
+- **smul — build the REAL taso `Mul` (`OP_MUL`).** `make(Smul([a,b]))` calls
+  `g.mul(a,b)` (unioning both operands' weight provenance), exactly as `make(Ewmul)`
+  calls `g.element` — so an extracted model **exports a genuine scalar multiply**.
+  This matters because `save_model` serializes the *taso graph* (`export_to_file_raw`),
+  not the egg expression: a `make()` shortcut that built nothing would silently drop
+  the multiply on export (worse than a panic). taso's `Mul` asserts the 2nd operand
+  is **0-D** ("broadcast unsupported"); the applier arm **gates on `numDim==0` and
+  declines** (never aborts) any other shape, so only genuine scalar-muls become
+  applicable — a corpus smul whose scalar binds to a model's 0-D input builds; one
+  matched against a non-scalar declines. `get_self_cost` charges 0 (cheap op; sound
+  now that `make` is faithful). The build+export round-trip can't be exercised in
+  this container (needs a taso input model with a scalar; onnx isn't importable —
+  the `../PROBLEMATIC.md` #5 split), so it's covered by the no-panic apply probe plus
+  the `make(Ewmul)` construction parallel.
+- **poolmax / poolavg** — the `make()` arms already build the *real* pool
+  (`g.pool2d_max`/`g.pool2d_avg`) for the stored metadata; only the applier arm was
+  missing. It reuses the input's shape-metadata as the transient apply result **iff
+  `sh==1 && sw==1 && pad==0`** (declines any other config), which is exactly the
+  shape-preserving case — so the transient result and `make()`'s real-pool shape
+  agree. Pool remains a genuine extractable op (unlike the Cpool bridge):
+  `reconstruct` rebuilds it from the op type + params, so the transient metadata
+  sharing the input's tensor is harmless.
+
+Un-gates the ~20k pool-on-RHS and ~28k smul-on-RHS rules. Remaining apply-unsafe:
+`concat3/4/5`, `enlarge`, `split`. See `../PROBLEMATIC.md` #8 and `../docs/ADD_AN_OP.md`.
 
 ## Build (`build.rs`, `Cargo.toml`, `wrapper.h`)
 

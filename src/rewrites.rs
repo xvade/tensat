@@ -987,6 +987,52 @@ fn check_pat(
                         (true, None, TData { dtype: DataKind::Const, val: 1_000_000 + kh * 1000 + kw, tnsr: None, tnsr_2: None })
                     }
 
+                    // smul(tensor, scalar): build the real taso Mul (OP_MUL). taso's Mul
+                    // requires a 0-D scalar 2nd operand -- decline (don't panic) any other
+                    // shape, so only genuine scalar-muls become applicable.
+                    Mdl::Smul([_a, _b]) => {
+                        let a_data = &results[0].2;
+                        let b_data = &results[1].2;
+                        if a_data.dtype != DataKind::Tnsr || b_data.dtype != DataKind::Tnsr {
+                            (false, None, TData::default())
+                        } else {
+                            let t_a = a_data.tnsr.unwrap();
+                            let t_b = b_data.tnsr.unwrap();
+                            if t_b.numDim != 0 {
+                                (false, None, TData::default())
+                            } else {
+                                unsafe {
+                                    let op = (*g.model).get_or_create_mul(&t_a, &t_b);
+                                    if op == Op_INVALID_OP {
+                                        (false, None, TData::default())
+                                    } else {
+                                        let t = (*op.ptr).outputs[0].clone();
+                                        (true, None, TData { dtype: DataKind::Tnsr, val: 0, tnsr: Some(t), tnsr_2: None })
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // 3x3 stride-1 SAME-pad pooling preserves shape (every corpus pool is
+                    // this config); the transient apply result reuses the input's shape and
+                    // make() builds the real pool for the stored metadata. Decline other configs.
+                    Mdl::Poolavg([_i, _kh, _kw, _sh, _sw, _pad, _act])
+                    | Mdl::Poolmax([_i, _kh, _kw, _sh, _sw, _pad, _act]) => {
+                        let inpt_data = &results[0].2;
+                        let same_shape = results[3].2.val == 1  // stride_h
+                            && results[4].2.val == 1            // stride_w
+                            && results[5].2.val == 0;           // padding == SAME
+                        if same_shape && inpt_data.dtype == DataKind::Tnsr {
+                            (true, None, TData {
+                                dtype: inpt_data.dtype, val: inpt_data.val,
+                                tnsr: inpt_data.tnsr.clone(), tnsr_2: inpt_data.tnsr_2.clone(),
+                            })
+                        } else {
+                            (false, None, TData::default())
+                        }
+                    }
+
                     other => {
                         println!("{:?}", other);
                         todo!()

@@ -21,6 +21,13 @@ Upstream tensat's own overview is `README.md` and `../TENSAT_SUMMARY.md`.
 
 ## New extraction behavior (`src/optimize.rs`)
 
+> **Runtime cost is off.** The stock `CostModel::get_self_cost` reads each op's
+> `(*op.ptr).runtime` from TASO, but our TASO force-zeroes op cost (this project isn't
+> about runtime efficiency — see `../TASO_SUMMARY.md` §5 / `../PROBLEMATIC.md` #11). So
+> runtime-driven extraction (default `optimize` / greedy / ILP) is **degenerate** (all
+> costs 0, reports `Best cost: 0.0`) — use **`--verif_cost`** for any verifiability run.
+> Guarded by `../NNs/tests/run_tests.sh` Test 13.
+
 | Feature | Flag | Notes |
 |---|---|---|
 | VerifCost — verifiability-aware extraction | `--verif_cost` | Extracts to minimize an IBP interval-gap-area cost instead of runtime. Steers maxout to cert_ub 9.65 vs 12.03 at the input form. **The right extraction for a verifiability win** — deterministic, immune to the `--n_diverse` collapse (see `../PROBLEMATIC.md`). |
